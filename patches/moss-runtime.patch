@@ -1214,7 +1214,7 @@ index ec3f3f6..e0f9d08 100644
  // MCP (Model Context Protocol) server over stdio (vqa-cli --mcp): exposes the
  // engine as agent-facing tools. `preset_model` is an optional id / gguf path
 diff --git a/src/models/moss_vl/moss_vl_model.cpp b/src/models/moss_vl/moss_vl_model.cpp
-index 902627b..79324a9 100644
+index 902627b..624491c 100644
 --- a/src/models/moss_vl/moss_vl_model.cpp
 +++ b/src/models/moss_vl/moss_vl_model.cpp
 @@ -24,6 +24,7 @@
@@ -1621,7 +1621,27 @@ index 902627b..79324a9 100644
      }
  
      // 3. plan the segment against the live caches, then make room:
-@@ -1727,17 +1847,15 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1706,13 +1826,17 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+     //    plan_from_text is cheap (tokenize + index bookkeeping), so plan ->
+     //    compact -> re-plan is fine.
+     PromptPlan seg;
+-    const int pos_base = n_past + sess_rdelta;           // mrope pos of slot n_past
++    const int slot_base = n_past;
++    const int pos_base = slot_base + sess_rdelta;       // absolute MRoPE position
+     if (!plan_from_text(text, grids, seg, pos_base, n_past, sess_vrows)) return false;
+     if (!session_compact_self((int)seg.ids.size() + gp.max_tokens + 64)) {
+         fprintf(stderr, "session context overflow (%d used, sink %d)\n", n_past, sess_nsink);
+         return false;
+     }
+-    if (n_past != pos_base - sess_rdelta) {              // compaction moved the slots
++    // Compaction also increases sess_rdelta, preserving pos_base. Comparing
++    // against pos_base - the NEW delta therefore misses every eviction.
++    // Compare the original physical slot instead (especially on text-only turns).
++    if (n_past != slot_base) {
+         if (!plan_from_text(text, grids, seg, n_past + sess_rdelta, n_past, sess_vrows))
+             return false;
+     }
+@@ -1727,17 +1851,15 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
  
      // 4. project the new frames' cross-KV rows (appended after the old ones)
      if (T_new > 0) {
@@ -1642,7 +1662,7 @@ index 902627b..79324a9 100644
              fprintf(stderr, "session vision: cache hit\n");
          } else {
              const int N = (int)(patches.size() / (3 * vc.patch * vc.patch));
-@@ -1746,57 +1864,21 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1746,57 +1868,21 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
          }
          if (!project_cross_kv(scache.merged, seg, sess_vrows)) return false;
      }

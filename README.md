@@ -7,7 +7,8 @@ the separately cloned frontend repository does not change this build.
 The patch exposes the MOSS runtime controls, corrects realtime initialization,
 commits the final generated token and a turn boundary on capped/interrupted
 turns, bounds the camera queue to recent frames, and accepts browser JPEG/PNG
-frames. CUDA graphs and flash attention remain enabled. Model dimensions and
+frames. Text-only turns rebuild physical KV positions after context eviction.
+CUDA graphs and flash attention remain enabled. Model dimensions and
 token identifiers still come from the GGUF/tokenizer; do not change them as
 performance knobs.
 
@@ -77,5 +78,12 @@ commit/push the workflow repository. The workflow checks patch compatibility
 and runs syntax/UTF-8/option/argument-quoting tests before installing CUDA or
 starting the expensive build. `build-info.json` records source refs, patch and
 binary hashes. Runtime setting changes need no code edits or rebuilding.
+
+Local real-model checks also cover a forced two-token cutoff and recovery,
+realtime question interruption, bounded queues, and repeated text-only turns
+that force eviction in a 1024-token context. Run `tests/runtime_smoke.py` with
+explicit binary/model/web paths; add `--context 1024 --cross-rows 1024 --long-cache`
+to exercise the eviction boundary. Model tests need Pillow and the user's GGUF;
+they use deterministic colored shapes rather than a live camera.
 
 Protocol reference: [MOSS realtime documentation](https://github.com/OpenMOSS/MOSS-VL/blob/main/inference/realtime/README.md).

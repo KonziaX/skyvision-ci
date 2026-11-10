@@ -37,6 +37,9 @@ def main():
     parser.add_argument("--web-dir", required=True)
     parser.add_argument("--port", type=int, default=8901)
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument("--context", type=int, default=4096)
+    parser.add_argument("--cross-rows", type=int)
+    parser.add_argument("--long-cache", action="store_true")
     parser.add_argument("--runtime-dir", help="Optional compiler/runtime DLL directory for local CPU builds")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -68,13 +71,15 @@ def main():
         return json.loads(raw), elapsed
 
     command = [str(pathlib.Path(args.binary).resolve()), "--models-dir", str(pathlib.Path(args.models_dir).resolve()),
-               "--web-dir", str(pathlib.Path(args.web_dir).resolve()), "--n-ctx", "4096", "--threads", "8",
+               "--web-dir", str(pathlib.Path(args.web_dir).resolve()), "--n-ctx", str(args.context), "--threads", "8",
                "--gpu" if args.gpu else "--cpu", "--serve", str(args.port)]
     env = os.environ.copy()
     if args.runtime_dir:
         env["PATH"] = str(pathlib.Path(args.runtime_dir).resolve()) + os.pathsep + env["PATH"]
     env.pop("MOSS_NO_STATIC", None)
     env.pop("MOSS_DUMP_DIR", None)
+    if args.cross_rows:
+        env["MOSS_XCTX"] = str(args.cross_rows)
     log = (run_dir / "server.log").open("wb")
     process = subprocess.Popen(command, cwd=run_dir, env=env, stdout=log, stderr=subprocess.STDOUT,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -92,7 +97,7 @@ def main():
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.1)
-        assert runtime["runtime_api"] == 2 and runtime["n_ctx"] == 4096
+        assert runtime["runtime_api"] == 2 and runtime["n_ctx"] == args.context
         models, _ = obj("/api/models")
         model = next(row for row in models["models"] if row["arch"] == "moss_vl")
         api = "/api/model/" + urllib.parse.quote(model["id"], safe="")
@@ -128,6 +133,17 @@ def main():
         report["tests"]["follow_after_cap"] = ask("右侧圆形是什么颜色？只回答颜色名称。", 24)
         assert report["tests"]["follow_after_cap"]["text"].strip(), "Capped response damaged the next turn"
         assert any(word in report["tests"]["follow_after_cap"]["text"].lower() for word in ("蓝", "blue")), "Visual context was lost"
+        if args.long_cache:
+            # With a 1024-token context these text-only turns force eviction.
+            # This exercises physical cache slots, retained vision, and MRoPE
+            # continuity together; a stale prefill plan used to overflow KV.
+            results = []
+            filler = "data " * 220
+            for index in range(5):
+                response = ask(filler + "\n以上只是占位文字。右侧圆形是什么颜色？请只回答颜色名称。", 16)
+                assert any(word in response["text"].lower() for word in ("蓝", "blue")), "Vision/position state was lost after cache eviction"
+                results.append(response)
+            report["tests"]["text_cache_eviction"] = results
 
         options = {"session": live, "src": "browser", "interval": 0.2, "frames": 1,
                    "n": 64, "observe-n": 48, "max-pixels": 262144 if args.gpu else 65536,
