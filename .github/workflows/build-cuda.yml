@@ -75,11 +75,11 @@ jobs:
           set "CUDA_ARCH=120"
           call scripts\build-cuda.bat
 
-      - name: Package executable
+      - name: Package executable and CUDA runtime
         shell: pwsh
         run: |
-          $build = Join-Path $env:GITHUB_WORKSPACE "skyvision\build-cuda"
           $package = Join-Path $env:GITHUB_WORKSPACE "package"
+          $build = Join-Path $env:GITHUB_WORKSPACE "skyvision\build-cuda"
 
           New-Item -ItemType Directory -Force $package | Out-Null
 
@@ -92,16 +92,31 @@ jobs:
 
           Copy-Item $exe.FullName $package -Force
 
-          Get-ChildItem $build -Filter *.dll -Recurse -File |
-            ForEach-Object {
-              Copy-Item $_.FullName $package -Force
+          # CUDA 13 runtime DLLs
+          $cudaDllNames = @(
+            "cublas64_13.dll",
+            "cublasLt64_13.dll",
+            "cudart64_13.dll",
+            "nvJitLink_130_0.dll"
+          )
+
+          foreach ($name in $cudaDllNames) {
+            $dll = Get-ChildItem $env:CUDA_PATH -Recurse `
+              -Filter $name -File -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+            if (-not $dll) {
+              throw "CUDA DLL not found: $name"
             }
 
-          @'
+            Copy-Item $dll.FullName $package -Force
+          }
+
+          @"
           SkyVision.cpp CUDA build
           Target GPU architecture: RTX 50 / sm_120
           Model files are not included.
-          '@ | Set-Content "$package\README.txt" -Encoding utf8
+          "@ | Set-Content "$package\README.txt" -Encoding utf8
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
