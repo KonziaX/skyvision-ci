@@ -1,0 +1,112 @@
+name: build-skyvision-cuda
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Clone SkyVision.cpp and ggml
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/SkYContact/SkyVision.cpp.git skyvision
+          git clone --depth 1 https://github.com/ggml-org/ggml.git skyvision/ggml
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.0"
+          method: local
+
+      - name: Locate MSVC toolchain
+        shell: pwsh
+        run: |
+          $vswhere = (Get-Command vswhere.exe -ErrorAction Stop).Source
+          $vs = [string](& $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath | Select-Object -First 1)
+
+          if (-not $vs) {
+            throw "Visual Studio C++ toolchain was not found"
+          }
+
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" `
+            -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName |
+            Select-Object -Last 1
+
+          if (-not (Test-Path $vcvars)) {
+            throw "vcvars64.bat was not found"
+          }
+
+          if (-not $cl) {
+            throw "cl.exe was not found"
+          }
+
+          @(
+            "VCVARS=$vcvars"
+            "CUDA_HOST_CL=$($cl.FullName)"
+            "CUDA_ARCH=120"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify build tools
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+          nvcc --version
+          Write-Host "VCVARS=$env:VCVARS"
+          Write-Host "CUDA_HOST_CL=$env:CUDA_HOST_CL"
+
+      - name: Build vqa-cli
+        shell: cmd
+        working-directory: skyvision
+        run: |
+          set "CUDA_ARCH=120"
+          call scripts\build-cuda.bat
+
+      - name: Package executable
+        shell: pwsh
+        run: |
+          $build = Join-Path $env:GITHUB_WORKSPACE "skyvision\build-cuda"
+          $package = Join-Path $env:GITHUB_WORKSPACE "package"
+
+          New-Item -ItemType Directory -Force $package | Out-Null
+
+          $exe = Get-ChildItem $build -Filter vqa-cli.exe -Recurse -File |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "vqa-cli.exe was not produced"
+          }
+
+          Copy-Item $exe.FullName $package -Force
+
+          Get-ChildItem $build -Filter *.dll -Recurse -File |
+            ForEach-Object {
+              Copy-Item $_.FullName $package -Force
+            }
+
+          @'
+          SkyVision.cpp CUDA build
+          Target GPU architecture: RTX 50 / sm_120
+          Model files are not included.
+          '@ | Set-Content "$package\README.txt" -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyvision-windows-cuda
+          path: package
+          if-no-files-found: error
+          retention-days: 7
