@@ -1,0 +1,1711 @@
+diff --git a/src/cli/realtime_options.hpp b/src/cli/realtime_options.hpp
+new file mode 100644
+index 0000000..3504349
+--- /dev/null
++++ b/src/cli/realtime_options.hpp
+@@ -0,0 +1,152 @@
++#pragma once
++
++#include <cerrno>
++#include <cmath>
++#include <cstdlib>
++#include <functional>
++#include <string>
++
++namespace vqa { namespace rt {
++
++struct Options {
++    double interval = 1.0;
++    int frames = 1;
++    int answer_tokens = 512;
++    int observe_tokens = 128;
++    int max_pixels = 262144;
++    double temperature = 0;
++    int top_k = 0;
++    double top_p = 1;
++    double repetition_penalty = 1.05;
++    int repeat_last_n = 128;
++    std::string video_size = "1920x1080";
++    double capture_fps = 30;
++    std::string pixel_format;
++    double warmup = 2;
++    int jpeg_quality = 2;
++    bool system = true;
++    std::string system_prompt;
++    std::string initial_prompt =
++        "请用中文简短描述当前画面，通常一到三句话。持续观察与用户问题相关的新变化，"
++        "没有新变化或已经回答完毕时输出 <|silence|>，不要反复描述相同内容。";
++};
++
++inline bool read_number(const std::string & raw, const char * name, double lo,
++                        double hi, double & value, std::string & error) {
++    if (raw.empty()) return true;
++    char * end = nullptr;
++    errno = 0;
++    const double v = std::strtod(raw.c_str(), &end);
++    if (errno || end == raw.c_str() || *end || !std::isfinite(v) || v < lo || v > hi) {
++        error = std::string("invalid ") + name + " (allowed " + std::to_string(lo) + ".." + std::to_string(hi) + ")";
++        return false;
++    }
++    value = v;
++    return true;
++}
++
++inline bool read_integer(const std::string & raw, const char * name, int lo,
++                         int hi, int & value, std::string & error) {
++    if (raw.empty()) return true;
++    char * end = nullptr;
++    errno = 0;
++    const long v = std::strtol(raw.c_str(), &end, 10);
++    if (errno || end == raw.c_str() || *end || v < lo || v > hi) {
++        error = std::string("invalid ") + name + " (allowed " + std::to_string(lo) + ".." + std::to_string(hi) + ")";
++        return false;
++    }
++    value = (int)v;
++    return true;
++}
++
++inline bool parse_options(const std::function<std::string(const char *)> & get,
++                          Options & o, std::string & error) {
++    if (!read_number(get("interval"), "interval", 0.2, 60, o.interval, error) ||
++        !read_integer(get("frames"), "frames", 1, 8, o.frames, error) ||
++        !read_integer(get("n"), "n", 1, 8192, o.answer_tokens, error) ||
++        !read_integer(get("observe-n"), "observe-n", 1, 8192, o.observe_tokens, error) ||
++        !read_integer(get("max-pixels"), "max-pixels", 4096, 16777216, o.max_pixels, error) ||
++        !read_number(get("temperature"), "temperature", 0, 2, o.temperature, error) ||
++        !read_integer(get("top-k"), "top-k", 0, 1000, o.top_k, error) ||
++        !read_number(get("top-p"), "top-p", 0.01, 1, o.top_p, error) ||
++        !read_number(get("repeat-penalty"), "repeat-penalty", 1, 2, o.repetition_penalty, error) ||
++        !read_integer(get("repeat-last-n"), "repeat-last-n", 0, 4096, o.repeat_last_n, error) ||
++        !read_number(get("capture-fps"), "capture-fps", 1, 120, o.capture_fps, error) ||
++        !read_number(get("warmup"), "warmup", 0, 15, o.warmup, error) ||
++        !read_integer(get("jpeg-quality"), "jpeg-quality", 1, 31, o.jpeg_quality, error)) return false;
++    const std::string size = get("video-size");
++    if (!size.empty() && size != "auto") {
++        const size_t x = size.find('x');
++        int w = 0, h = 0;
++        if (x == std::string::npos ||
++            !read_integer(size.substr(0, x), "video width", 16, 7680, w, error) ||
++            !read_integer(size.substr(x + 1), "video height", 16, 4320, h, error) || !w || !h) {
++            if (error.empty()) error = "video-size must be WIDTHxHEIGHT or auto";
++            return false;
++        }
++        o.video_size = size;
++    } else if (size == "auto") o.video_size.clear();
++    const std::string pixel = get("pixel-format");
++    if (!pixel.empty() && pixel != "auto") {
++        for (unsigned char c : pixel) {
++            if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) {
++                error = "invalid pixel-format"; return false;
++            }
++        }
++        if (pixel.size() > 32) { error = "pixel-format is too long"; return false; }
++        o.pixel_format = pixel;
++    }
++    const std::string sys = get("sys");
++    if (!sys.empty() && sys != "0" && sys != "1") { error = "sys must be 0 or 1"; return false; }
++    if (!sys.empty()) o.system = sys == "1";
++    if (!get("prompt").empty()) o.initial_prompt = get("prompt");
++    o.system_prompt = get("system-prompt");
++    if (o.initial_prompt.size() > 8192 || o.system_prompt.size() > 8192) {
++        error = "prompt exceeds 8192 bytes"; return false;
++    }
++    return true;
++}
++
++// The tokenizer may divide one Chinese character across several tokens.
++struct Utf8Output {
++    std::string carry;
++    std::string append(const std::string & piece) {
++        std::string s = carry + piece;
++        carry.clear();
++        size_t emit = s.size();
++        const size_t lo = s.size() > 4 ? s.size() - 4 : 0;
++        for (size_t k = s.size(); k > lo; --k) {
++            const unsigned char b = (unsigned char)s[k - 1];
++            if (b < 0x80) break;
++            if (b >= 0xC0) {
++                const size_t need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : 2;
++                if (s.size() - (k - 1) < need) emit = k - 1;
++                break;
++            }
++        }
++        if (emit < s.size()) { carry = s.substr(emit); s.resize(emit); }
++        return s;
++    }
++};
++
++// Quote an argument for CreateProcess (Windows) or popen's shell (POSIX).
++inline std::string quote_arg(const std::string & value) {
++#ifdef _WIN32
++    std::string out = "\"";
++    size_t slashes = 0;
++    for (char c : value) {
++        if (c == '\\') { ++slashes; continue; }
++        if (c == '"') { out.append(slashes * 2 + 1, '\\'); out += c; }
++        else { out.append(slashes, '\\'); out += c; }
++        slashes = 0;
++    }
++    out.append(slashes * 2, '\\');
++    return out + '"';
++#else
++    std::string out = "'";
++    for (char c : value) out += c == '\'' ? "'\\''" : std::string(1, c);
++    return out + '\'';
++#endif
++}
++
++}} // namespace vqa::rt
+diff --git a/src/cli/vqa_cli.cpp b/src/cli/vqa_cli.cpp
+index 0830580..bc65b28 100644
+--- a/src/cli/vqa_cli.cpp
++++ b/src/cli/vqa_cli.cpp
+@@ -72,6 +72,10 @@ void usage() {
+         "                   default (moondream3.1: 1024, videochat3: 8192). Larger\n"
+         "                   values cost VRAM: moondream needs ~196 KB per token\n"
+         "  --threads N      CPU threads\n"
++        "  --web-dir D      Web UI directory (default web)\n"
++        "  --max-pixels N   MOSS media pixel budget (0 = backend default)\n"
++        "  --repeat-penalty P  MOSS repetition penalty (default 1.0)\n"
++        "  --repeat-last-n N   MOSS repetition window (default 128)\n"
+         "  --gpu            prefer CUDA (default when the build has it)\n"
+         "  --cpu            force the CPU backend\n"
+         "  --vision <gguf>  vision tower file (moondream3.1)\n"
+@@ -86,6 +90,8 @@ void usage() {
+ 
+ int main(int argc, char ** argv) {
+ #ifdef _WIN32
++    SetConsoleOutputCP(CP_UTF8);
++    SetConsoleCP(CP_UTF8);
+     // rebuild argv as UTF-8: the default ANSI argv mangles CJK prompts/paths
+     {
+         int wargc = 0;
+@@ -113,6 +119,9 @@ int main(int argc, char ** argv) {
+     std::string speaker;
+     bool embed_given = false;
+     int max_tokens = 256, n_ctx = 0, top_k = 0, threads = 0;
++    int max_pixels = 0, repeat_last_n = 128;
++    float repetition_penalty = 1.0f;
++    std::string web_dir = "web";
+     int max_codes = 400;   // 0 = backend default
+     int ep_dim = 0;
+     float temp = 0.0f, top_p = 1.0f, fps = 0.0f, threshold = 0.0f;
+@@ -144,6 +153,10 @@ int main(int argc, char ** argv) {
+         else if (a == "--serve") { serve_port = atoi(next("--serve")); if (serve_port <= 0) serve_port = 8899; }
+         else if (a == "--host") serve_host = next("--host");
+         else if (a == "--models-dir") models_dir = next("--models-dir");
++        else if (a == "--web-dir") web_dir = next("--web-dir");
++        else if (a == "--max-pixels") max_pixels = atoi(next("--max-pixels"));
++        else if (a == "--repeat-penalty") repetition_penalty = (float)atof(next("--repeat-penalty"));
++        else if (a == "--repeat-last-n") repeat_last_n = atoi(next("--repeat-last-n"));
+         else if (a == "--mcp") mcp_mode = true;
+         else if (a == "--specs") { printf("%s\n", vqa::specs_to_json().c_str()); return 0; }
+         else if (a == "--batch") batch_path = next("--batch");
+@@ -180,8 +193,15 @@ int main(int argc, char ** argv) {
+     }
+     if (serve_port > 0) {
+         const std::string dir = models_dir.empty() ? "." : models_dir;
+-        return vqa::run_web_ui(serve_port, dir, "web", tokenizer_arg.empty() ? "" : tokenizer_arg,
+-                               serve_host.c_str(), use_gpu);
++        vqa::LoadOptions load_options;
++        load_options.n_ctx = n_ctx;
++        load_options.n_threads = threads;
++        load_options.use_gpu = use_gpu;
++        load_options.dump_dir = dump_dir;
++        load_options.vision_path = vision_path;
++        load_options.region_path = region_path;
++        return vqa::run_web_ui(serve_port, dir, web_dir, tokenizer_arg.empty() ? "" : tokenizer_arg,
++                               serve_host.c_str(), load_options);
+     }
+ 
+     if (model_path.empty()) { usage(); return 2; }
+@@ -266,6 +286,9 @@ int main(int argc, char ** argv) {
+     if (!speaker.empty()) gp.speaker = speaker;
+     if (max_codes != 400) gp.max_codes = max_codes;
+     gp.max_tokens = max_tokens;
++    gp.max_pixels = max_pixels;
++    gp.repetition_penalty = repetition_penalty;
++    gp.repeat_last_n = repeat_last_n;
+     gp.temperature = temp;
+     gp.top_k = top_k;
+     gp.top_p = top_p;
+diff --git a/src/cli/vqa_server.cpp b/src/cli/vqa_server.cpp
+index 7ec9ed8..16076f3 100644
+--- a/src/cli/vqa_server.cpp
++++ b/src/cli/vqa_server.cpp
+@@ -15,6 +15,7 @@
+ #include "core/media/media_io.hpp"
+ #include "core/runtime/model_registry.hpp"
+ #include "core/runtime/vqa_spec.hpp"
++#include "cli/realtime_options.hpp"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -25,7 +26,9 @@
+ #include <thread>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
+ #include <cstring>
++#include <filesystem>
+ #include <mutex>
+ #include <string>
+ #include <vector>
+@@ -51,12 +54,10 @@ std::string g_arch_placeholder;      // ditto, for arch-conditional UI
+ vqa::ModelRegistry g_reg;
+ 
+ // server-wide backend choice (the CLI's --cpu/--gpu; default follows the CLI)
+-bool g_use_gpu = true;
++vqa::LoadOptions g_load_options;
+ 
+ vqa::LoadOptions server_load_options() {
+-    vqa::LoadOptions o;
+-    o.use_gpu = g_use_gpu;
+-    return o;
++    return g_load_options;
+ }
+ 
+ // ------------------------------------------------------- async model swap
+@@ -137,32 +138,53 @@ static void swap_thread(std::string id, const ModelEntry e) {
+ struct CapProc {
+     PROCESS_INFORMATION pi = {};
+     HANDLE rh = INVALID_HANDLE_VALUE;
++    HANDLE eh = INVALID_HANDLE_VALUE;
++    HANDLE job = nullptr;
++    std::thread error_reader;
++    std::mutex error_mu;
++    std::string errors;
++    bool stopped = false;
+     bool spawn(const std::string & cmd) {
+         SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, TRUE };
+-        HANDLE wh;
++        HANDLE wh = INVALID_HANDLE_VALUE, ew = INVALID_HANDLE_VALUE;
+         if (!CreatePipe(&rh, &wh, &sa, 0)) return false;
+         SetHandleInformation(rh, HANDLE_FLAG_INHERIT, 0);
+-        // NOTE: no "cmd /c" here — cmd's quote-stripping rules mangle commands
+-        // with 3+ quotes (path + args); CreateProcessA parses them natively
+-        std::string full = cmd;
+-        STARTUPINFOA si = {};
++        if (!CreatePipe(&eh, &ew, &sa, 0)) { CloseHandle(wh); return false; }
++        SetHandleInformation(eh, HANDLE_FLAG_INHERIT, 0);
++        STARTUPINFOW si = {};
+         si.cb = sizeof(si);
+         si.dwFlags = STARTF_USESTDHANDLE | STARTF_USESHOWWINDOW;
+         si.hStdOutput = wh;
+-        // NUL for stdin/stderr: with STARTF_USESTDHANDLE all three handles
+-        // must be valid, and inheriting the console's breaks hidden starts
+         HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_WRITE,
+                                  &sa, OPEN_EXISTING, 0, nullptr);
+-        si.hStdError = nul;
++        si.hStdError = ew;
+         si.hStdInput = nul == INVALID_HANDLE_VALUE ? wh : nul;
+         si.wShowWindow = SW_HIDE;
+-        std::vector<char> buf(full.begin(), full.end());
+-        buf.push_back(0);
+-        if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+-            CloseHandle(rh); rh = INVALID_HANDLE_VALUE;
+-            return false;
++        const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cmd.c_str(), -1, nullptr, 0);
++        std::vector<wchar_t> buf((size_t)std::max(1, count));
++        if (count > 0) MultiByteToWideChar(CP_UTF8, 0, cmd.c_str(), -1, buf.data(), count);
++        const bool ok = count > 0 && CreateProcessW(nullptr, buf.data(), nullptr, nullptr,
++            TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
++        CloseHandle(wh);
++        CloseHandle(ew);
++        if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
++        if (!ok) return false;
++        // Keep the owned FFmpeg child from surviving a console/server exit.
++        job = CreateJobObjectW(nullptr, nullptr);
++        if (job) {
++            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit = {};
++            limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++            if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limit, sizeof(limit)) ||
++                !AssignProcessToJobObject(job, pi.hProcess)) { CloseHandle(job); job = nullptr; }
+         }
+-        CloseHandle(wh);   // child owns the write end now
++        error_reader = std::thread([this] {
++            char buf[2048]; DWORD got;
++            while (ReadFile(eh, buf, sizeof(buf), &got, nullptr) && got) {
++                std::lock_guard<std::mutex> lk(error_mu);
++                errors.append(buf, got);
++                if (errors.size() > 8192) errors.erase(0, errors.size() - 8192);
++            }
++        });
+         return true;
+     }
+     int read(char * out, int n) {
+@@ -171,8 +193,24 @@ struct CapProc {
+         return (int)got;
+     }
+     void stop() {
+-        if (pi.hProcess) { TerminateProcess(pi.hProcess, 0); WaitForSingleObject(pi.hProcess, 2000); }
++        if (!stopped && pi.hProcess) {
++            stopped = true;
++            TerminateProcess(pi.hProcess, 0);
++            WaitForSingleObject(pi.hProcess, 2000);
++        }
++        if (error_reader.joinable()) error_reader.join();
++        // rh stays open until the outer capture-reader thread has joined.
++    }
++    std::string error_text() { std::lock_guard<std::mutex> lk(error_mu); return errors; }
++    bool failed() {
++        DWORD code = 0;
++        return pi.hProcess && GetExitCodeProcess(pi.hProcess, &code) && code != 0 && code != STILL_ACTIVE;
++    }
++    ~CapProc() {
++        stop();
+         if (rh != INVALID_HANDLE_VALUE) { CloseHandle(rh); rh = INVALID_HANDLE_VALUE; }
++        if (eh != INVALID_HANDLE_VALUE) CloseHandle(eh);
++        if (job) CloseHandle(job);
+         if (pi.hProcess) CloseHandle(pi.hProcess);
+         if (pi.hThread) CloseHandle(pi.hThread);
+         pi = {};
+@@ -185,23 +223,31 @@ struct CapProc {
+     bool spawn(const std::string & cmd) { p = popen((cmd + " 2>/dev/null").c_str(), "r"); return p != nullptr; }
+     int read(char * out, int n) { return p ? (int)fread(out, 1, n, p) : 0; }
+     void stop() { if (p) pclose(p); p = nullptr; }
++    std::string error_text() { return ""; }
++    bool failed() { return false; }
+ };
+ #endif
+ 
+ struct RtStream {
+-    std::string session, src;
+-    double interval = 3.0;
+-    int frames_per_turn = 1;
+-    bool use_sys_prompt = true;
++    std::string session, src, model_id, uploaded_path;
++    vqa::rt::Options options;
+     CapProc cap;
+     std::thread reader, worker;
+     std::mutex mu;
++    std::condition_variable cv;
+     std::deque<std::pair<std::vector<unsigned char>, double>> jpegs;  // pending (frame, t)
+     std::deque<std::string> prompts;
+     std::deque<std::string> events;   // NDJSON lines, oldest first
++    std::vector<unsigned char> preview;
++    double last_timestamp = -1;
++    unsigned long long captured = 0, dropped = 0;
++    bool source_ended = false;
++    vqa::rt::Utf8Output utf8;
++    vqa::GenStats last_stats;
+     std::string silence_tok;          // backend's "nothing to say" piece (if any)
+     long seq = 0;
+     std::atomic<bool> stop_flag{false};
++    std::atomic<bool> interrupt{false};
+     bool started = false;
+ 
+     void push_event(const std::string & line) {
+@@ -210,16 +256,45 @@ struct RtStream {
+         events.push_back("{\"seq\":" + std::to_string(++seq) + "," + line.substr(1));
+         if (events.size() > 4096) events.erase(events.begin(), events.end() - 4096);
+     }
++    bool push_frame(std::vector<unsigned char> jpg, double t) {
++        std::lock_guard<std::mutex> lk(mu);
++        if (!std::isfinite(t) || t < 0 || t < last_timestamp || jpg.empty()) return false;
++        preview = jpg;
++        last_timestamp = t;
++        ++captured;
++        jpegs.push_back({std::move(jpg), t});
++        while ((int)jpegs.size() > options.frames) { jpegs.pop_front(); ++dropped; }
++        cv.notify_all();
++        return true;
++    }
+     ~RtStream() {
+         stop_flag = true;
++        cv.notify_all();
+         cap.stop();
+         if (reader.joinable()) reader.join();
+         if (worker.joinable()) worker.join();
++        if (!uploaded_path.empty()) std::remove(uploaded_path.c_str());
+     }
+ };
+ static std::map<std::string, std::shared_ptr<RtStream>> g_rt;
+ static std::mutex g_rt_mu;
+ 
++static bool realtime_busy() {
++    std::lock_guard<std::mutex> lk(g_rt_mu);
++    return !g_rt.empty();
++}
++
++static std::string stats_json(const vqa::GenStats & s) {
++    char values[512];
++    snprintf(values, sizeof(values),
++        "\"tokens\":%d,\"vision_ms\":%.2f,\"prefill_ms\":%.2f,\"decode_ms\":%.2f,"
++        "\"first_token_ms\":%.2f,\"total_ms\":%.2f,\"tokens_per_second\":%.2f",
++        s.generated_tokens, s.vision_ms, s.prefill_ms, s.decode_ms, s.first_token_ms, s.total_ms,
++        s.decode_ms > 0 ? s.generated_tokens * 1000.0 / s.decode_ms : 0.0);
++    return std::string("{") + values + ",\"finish_reason\":\"" +
++           vqa::http::json_escape(s.finish_reason) + "\"}";
++}
++
+ static std::string ffmpeg_path() {
+     if (const char * e = getenv("FFMPEG")) return e;
+     return "ffmpeg";
+@@ -245,7 +320,12 @@ static void rt_reader_loop(std::shared_ptr<RtStream> s) {
+     while (!s->stop_flag) {
+         int got = s->cap.read(tmp, sizeof(tmp));
+         if (got <= 0) {   // source ended or died
+-            s->push_event("{\"event\":\"source_end\"}\n");
++            if (!s->stop_flag) {
++                const std::string error = s->cap.failed() ? s->cap.error_text() : "";
++                s->push_event("{\"event\":\"source_end\",\"detail\":\"" + vqa::http::json_escape(error) + "\"}\n");
++            }
++            { std::lock_guard<std::mutex> lk(s->mu); s->source_ended = true; }
++            s->cv.notify_all();
+             break;
+         }
+         buf.insert(buf.end(), tmp, tmp + got);
+@@ -256,11 +336,7 @@ static void rt_reader_loop(std::shared_ptr<RtStream> s) {
+                     double t = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0).count();
+                     std::vector<unsigned char> jpg(buf.begin() + frame_start, buf.begin() + i + 1);
+-                    {
+-                        std::lock_guard<std::mutex> lk(s->mu);
+-                        s->jpegs.push_back({jpg, t});
+-                        while (s->jpegs.size() > 16) s->jpegs.pop_front();   // keep realtime
+-                    }
++                    s->push_frame(std::move(jpg), t);
+                 }
+                 buf.erase(buf.begin(), buf.begin() + i + 1);
+                 frame_start = std::string::npos;
+@@ -270,84 +346,110 @@ static void rt_reader_loop(std::shared_ptr<RtStream> s) {
+             if (buf[i - 1] == 0xFF && buf[i] == 0xD8 && frame_start == std::string::npos)
+                 frame_start = i - 1;
+         }
++        if (buf.size() > 20u * 1024 * 1024) {
++            s->push_event("{\"error\":\"capture frame exceeds 20 MiB\"}\n");
++            break;
++        }
+     }
+ }
+ 
+ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
+-    bool first = true;
++    bool saw_vision = false;
++    auto next_turn = std::chrono::steady_clock::now();
+     while (!s->stop_flag) {
+-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+-        if (s->stop_flag) break;
+-        // wait out the turn interval
+-        // (checked in 200ms slices so stop/say react quickly)
+-        static thread_local double since = 0.0;
+-        since += 0.2;
+-        if (since < s->interval) continue;
+-        since = 0.0;
+-        // drain the pending frames + prompts. A queued question goes out on
+-        // its own turn (frames wait for the next one): the realtime SFT is
+-        // touchy about prompt+new-frame turns and reliably answers text-only
+-        // questions while narration stays on frame-only turns.
+         vqa::MediaInput media;
+         media.kind = vqa::MediaKind::Video;
+         std::string q;
++        std::deque<std::pair<std::vector<unsigned char>, double>> frames;
++        vqa::rt::Options options;
+         {
+-            std::lock_guard<std::mutex> lk(s->mu);
+-            bool has_q = !s->prompts.empty();
+-            while (!s->prompts.empty()) {
+-                if (!q.empty()) q += "\n";
++            std::unique_lock<std::mutex> lk(s->mu);
++            for (;;) {
++                if (s->stop_flag) break;
++                const auto now = std::chrono::steady_clock::now();
++                const bool question = !s->prompts.empty() && (saw_vision || !s->jpegs.empty());
++                if (question || (!s->jpegs.empty() && now >= next_turn)) break;
++                if (!s->jpegs.empty() && now < next_turn) s->cv.wait_until(lk, next_turn);
++                else s->cv.wait(lk);
++            }
++            if (s->stop_flag) break;
++            options = s->options;
++            if (!s->prompts.empty()) {
+                 q += s->prompts.front();
+                 s->prompts.pop_front();
+             }
+-            if (has_q) { /* text-only question turn */ }
+-            else {
+-            int n = std::min<int>((int)s->jpegs.size(), std::max(1, s->frames_per_turn));
+-            for (int i = 0; i < n; i++) {
+-                vqa::MediaInput one;
+-                if (vqa::load_image_from_memory(
+-                        std::string(s->jpegs.front().first.begin(), s->jpegs.front().first.end()), one)) {
+-                    if (one.frames.empty()) continue;
+-                    media.frames.push_back(std::move(one.frames[0]));
+-                    media.width = one.width;
+-                    media.height = one.height;
+-                    media.timestamps.push_back(s->jpegs.front().second);
+-                }
+-                s->jpegs.pop_front();
++            // Reader/API already bound this to the newest frames. Never infer
++            // an accumulated FIFO backlog while the camera keeps moving.
++            frames.swap(s->jpegs);
++            s->interrupt = false;
++            next_turn = std::chrono::steady_clock::now() +
++                std::chrono::milliseconds((long long)(options.interval * 1000));
++        }
++        for (auto & frame : frames) {
++            vqa::MediaInput one;
++            if (!vqa::load_image_from_memory(std::string(frame.first.begin(), frame.first.end()), one) || one.frames.empty()) {
++                s->push_event("{\"error\":\"cannot decode captured frame\"}\n");
++                continue;
+             }
++            if (!media.frames.empty() && (one.width != media.width || one.height != media.height)) {
++                media.frames.clear(); media.timestamps.clear(); // resolution switched: keep the newest size
+             }
++            media.width = one.width; media.height = one.height;
++            media.frames.push_back(std::move(one.frames[0]));
++            media.timestamps.push_back(frame.second);
++        }
++        if (!saw_vision && media.frames.empty() && !q.empty()) {
++            std::lock_guard<std::mutex> lk(s->mu);
++            s->prompts.push_front(q);
++            continue;
+         }
+         if (media.frames.empty() && q.empty()) continue;   // nothing new to say
+-        // model speaking on its own: frames-only turns, silence ends them
+         vqa::GenParams gp;
+-        gp.max_tokens = 200;
+-        std::string carry;
++        gp.max_tokens = q.empty() ? options.observe_tokens : options.answer_tokens;
++        gp.max_pixels = options.max_pixels;
++        gp.temperature = (float)options.temperature;
++        gp.top_k = options.top_k;
++        gp.top_p = (float)options.top_p;
++        gp.repetition_penalty = (float)options.repetition_penalty;
++        gp.repeat_last_n = options.repeat_last_n;
++        gp.continuous = true;
++        gp.initial_prompt = options.initial_prompt;
++        gp.is_cancelled = [](void * ud) {
++            auto * stream = (RtStream *)ud;
++            return stream->stop_flag.load() || stream->interrupt.load();
++        };
++        gp.cancel_ud = s.get();
++        vqa::GenStats stats;
++        gp.stats = &stats;
++        s->utf8.carry.clear();
+         gp.on_token = [](const char * piece, void * ud) {
+             RtStream * s = (RtStream *)ud;
+             if (!s->silence_tok.empty() && s->silence_tok == piece) return;
+-            s->push_event(std::string("{\"t\":\"") +
+-                          vqa::http::json_escape(piece) + "\"}\n");
++            const std::string complete = s->utf8.append(piece);
++            if (!complete.empty()) s->push_event("{\"t\":\"" + vqa::http::json_escape(complete) + "\"}\n");
+         };
+         gp.on_token_ud = s.get();
+-        if (first) {
+-            first = false;
+-            // the realtime SFT goes mute (and stays mute for later questions)
+-            // when turn 1 carries no user text — seed one so the narration
+-            // lands as a normal answer and the session stays responsive
+-            if (q.empty()) q = "Please observe and describe what you see.";
+-        }
++        gp.on_stage = [](const char * stage, int done, int total, void * ud) {
++            auto * stream = (RtStream *)ud;
++            stream->push_event("{\"stage\":\"" + vqa::http::json_escape(stage) +
++                "\",\"done\":" + std::to_string(done) + ",\"total\":" + std::to_string(total) + "}\n");
++        };
++        gp.on_stage_ud = s.get();
+         std::string out;
+         s->push_event(q.empty() ? "{\"event\":\"observe\"}\n"
+                                 : std::string("{\"event\":\"ask\",\"q\":\"") + vqa::http::json_escape(q) + "\"}\n");
+         {
+             std::lock_guard<std::mutex> lk(g_mu);
+             vqa::Model * m = g_reg.loaded();
+-            if (m && s->use_sys_prompt) {
++            if (m && options.system) {
+                 // the chat template AND the protocol prompt belong to the
+                 // backend, not this protocol layer — asking the model keeps front
+                 // ends template-agnostic (RT_SYSTEM_PROMPT is only the fallback
+                 // for backends that do not declare one)
+                 const char * sys = m->realtime_system_prompt();
+-                gp.history = m->format_system((sys && sys[0]) ? sys : RT_SYSTEM_PROMPT);
++                const std::string system = options.system_prompt.empty()
++                    ? std::string((sys && sys[0]) ? sys : RT_SYSTEM_PROMPT) : options.system_prompt;
++                gp.history = m->format_system(system);
+             }
+             if (m) s->silence_tok = m->silence_piece();
+             if (!m || g_reg.loaded_id() != model_id) {
+@@ -356,42 +458,63 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
+             }
+             if (!m->ask_session(media, q, gp, out)) {
+                 s->push_event("{\"error\":\"turn failed\"}\n");
++                m->session_reset();
++                saw_vision = false;
+                 continue;
+             }
+         }
++        if (!media.frames.empty()) saw_vision = true;
++        // Drop an incomplete trailing UTF-8 byte sequence at a forced cap; the
++        // browser never receives malformed JSON strings or replacement glyphs.
++        s->utf8.carry.clear();
+         // the three-state protocol answers with a bare control token when it has
+         // nothing to report (</Silence> / </Standby>), so those count as silence
+         const bool no_answer = out.empty() || out == s->silence_tok || out == "</Standby>";
+-        s->push_event(no_answer ? "{\"event\":\"silence\"}\n"
+-                                : "{\"event\":\"turn_end\"}\n");
++        unsigned long long dropped;
++        { std::lock_guard<std::mutex> lk(s->mu); s->last_stats = stats; dropped = s->dropped; }
++        s->push_event(std::string("{\"event\":\"") + (no_answer ? "silence" : "turn_end") +
++            "\",\"stats\":" + stats_json(stats) + ",\"dropped_frames\":" + std::to_string(dropped) + "}\n");
+     }
+ }
+ 
+ static bool rt_start(const std::string & session, const std::string & src,
+-                     double interval, int frames_per_turn, bool use_sys_prompt,
+-                     std::string & err) {
++                     const vqa::rt::Options & options,
++                     std::string & err, const std::string & uploaded_path = "") {
+     std::lock_guard<std::mutex> lk(g_rt_mu);
+-    if (g_rt.count(session)) { err = "session already streaming"; return false; }
++    if (!g_rt.empty()) { err = "one realtime session is already active; stop it first"; return false; }
+     auto s = std::make_shared<RtStream>();
+     s->session = session;
+     s->src = src;
+-    s->interval = interval > 0.2 ? interval : 3.0;
+-    s->frames_per_turn = frames_per_turn > 0 ? frames_per_turn : 1;
+-    s->use_sys_prompt = use_sys_prompt;
++    s->options = options;
++    s->model_id = g_reg.loaded_id();
++    s->uploaded_path = uploaded_path;
+     // src: "video=..." -> Windows dshow camera; anything else is a path/URL
+     std::string input;
+-    if (src.rfind("video=", 0) == 0)
+-        input = "-f dshow -i \"" + src + "\"";
+-    else
+-        input = "-re -i \"" + src + "\"";
+-    const double fps = 1.0 / s->interval;
+-    char tail[160];
+-    snprintf(tail, sizeof(tail), "-vf fps=%.3f -f image2pipe -vcodec mjpeg -", fps);
+-    std::string cmd = "\"" + ffmpeg_path() + "\" -nostdin -hide_banner -loglevel error " + input + " " + tail;
+-    if (!s->cap.spawn(cmd)) { err = "cannot spawn ffmpeg (check FFMPEG / source)"; return false; }
++    if (src != "browser") {
++        const bool camera = src.rfind("video=", 0) == 0;
++        if (camera) {
++            input = "-f dshow -rtbufsize 64M ";
++            if (!options.video_size.empty()) input += "-video_size " + options.video_size + " ";
++            input += "-framerate " + std::to_string(options.capture_fps) + " ";
++            if (!options.pixel_format.empty()) input += "-pixel_format " + options.pixel_format + " ";
++            input += "-i " + vqa::rt::quote_arg(src);
++        } else input = "-re -i " + vqa::rt::quote_arg(src);
++        char filter[256];
++        // trim by elapsed media time; camera warm-up must not depend on 30/60 FPS.
++        snprintf(filter, sizeof(filter), "setpts=PTS-STARTPTS,trim=start=%.3f,setpts=PTS-STARTPTS,fps=%.6f",
++                 camera ? options.warmup : 0.0, 1.0 / options.interval);
++        const std::string cmd = vqa::rt::quote_arg(ffmpeg_path()) +
++            " -nostdin -hide_banner -loglevel warning " + input +
++            " -an -vf " + vqa::rt::quote_arg(filter) + " -q:v " + std::to_string(options.jpeg_quality) +
++            " -f image2pipe -vcodec mjpeg -";
++        fprintf(stderr, "realtime: interval %.2fs, pixels %d, observe %d / answer %d tokens\n",
++                options.interval, options.max_pixels, options.observe_tokens, options.answer_tokens);
++        if (!s->cap.spawn(cmd)) { err = "cannot spawn ffmpeg (check FFMPEG / source)"; return false; }
++    }
++    g_reg.loaded()->session_reset();
+     s->started = true;
+     g_rt[session] = s;
+-    s->reader = std::thread(rt_reader_loop, s);
++    if (src != "browser") s->reader = std::thread(rt_reader_loop, s);
+     s->worker = std::thread(rt_worker_loop, s, g_reg.loaded_id());
+     return true;
+ }
+@@ -406,10 +529,12 @@ static void rt_stop(const std::string & session) {
+         g_rt.erase(it);
+     }
+     s->stop_flag = true;
++    s->cv.notify_all();
+     s->cap.stop();
+     if (s->reader.joinable()) s->reader.join();
+     if (s->worker.joinable()) s->worker.join();
+-    if (g_reg.loaded()) g_reg.loaded()->session_reset();
++    std::lock_guard<std::mutex> lk(g_mu);
++    if (g_reg.loaded() && g_reg.loaded_id() == s->model_id) g_reg.loaded()->session_reset();
+ }
+ 
+ std::string read_file(const std::string & p) {
+@@ -482,6 +607,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+     // --- API ---
+     if (req.method == "GET" && req.path == "/api/models") { send_json(c, models_json()); return true; }
+     if (req.method == "GET" && req.path == "/api/specs") { send_json(c, vqa::specs_to_json()); return true; }
++    if (req.method == "GET" && req.path == "/api/runtime") {
++        send_json(c, "{\"runtime_api\":2,\"rt_frame\":true,\"cancel\":true,\"n_ctx\":" +
++            std::to_string(g_load_options.n_ctx) + ",\"threads\":" + std::to_string(g_load_options.n_threads) +
++            ",\"gpu\":" + (g_load_options.use_gpu ? "true" : "false") + "}");
++        return true;
++    }
+ 
+     if (req.path.rfind("/api/model/", 0) == 0) {
+         std::string rest = req.path.substr(11);
+@@ -494,35 +625,54 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+         if (action.rfind("rt/", 0) == 0) {
+             const std::string sess = query_param(req.query, "session");
+             if (sess.empty()) { send_error(c, "need ?session="); return true; }
++            if (sess.size() > 64 || sess.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos) {
++                send_error(c, "session must contain at most 64 letters, digits, underscores or hyphens"); return true;
++            }
+             if (action == "rt/start" && req.method == "POST") {
++                if (realtime_busy()) {
++                    send(c, "409 Conflict", "application/json", "{\"error\":\"stop the current realtime stream first\"}"); return true;
++                }
++                vqa::rt::Options options;
++                std::string err;
++                if (!vqa::rt::parse_options([&](const char * key) { return query_param(req.query, key); }, options, err)) {
++                    send_error(c, err); return true;
++                }
+                 std::string busy_id;
+                 if (swap_busy(&busy_id)) { swap_409(c, busy_id); return true; }
+                 std::lock_guard<std::mutex> lk(g_mu);
+-                std::string err;
+                 if (!ensure_loaded(*e, err)) { send_error(c, err); return true; }
+-                g_reg.loaded()->session_reset();   // a new stream always starts fresh
+                 std::string src = query_param(req.query, "src");
++                std::string upload;
+                 if (src.empty() && !req.body.empty()) {
+                     // uploaded video = the stream itself (plays in realtime with -re)
+-                    static std::string up = "rt_upload.tmp";
+-                    FILE * f = fopen(up.c_str(), "wb");
++                    std::error_code ec;
++                    std::filesystem::create_directories("work", ec);
++                    upload = "work/rt-upload-" + sess + ".tmp";
++                    if (ec || std::filesystem::exists(upload)) { send_error(c, "cannot create a unique upload file"); return true; }
++                    FILE * f = fopen(upload.c_str(), "wb");
+                     if (!f) { send_error(c, "cannot write upload"); return true; }
+-                    fwrite(req.body.data(), 1, req.body.size(), f);
++                    const size_t written = fwrite(req.body.data(), 1, req.body.size(), f);
+                     fclose(f);
+-                    src = up;
++                    if (written != req.body.size()) { std::remove(upload.c_str()); send_error(c, "incomplete video upload"); return true; }
++                    src = upload;
+                 }
+                 if (src.empty()) { send_error(c, "need ?src=<camera|path|url> or a video body"); return true; }
+-                double interval = atof(query_param(req.query, "interval").c_str());
+-                int fpt = atoi(query_param(req.query, "frames").c_str());
+                 std::string rerr;
+-                // the official realtime system prompt is an admitted placeholder
+-                // (train/inference divergence suppresses speech) - off by default
+-                const bool sysp = query_param(req.query, "sys") == "1";
+-                if (!rt_start(sess, src, interval, fpt, sysp, rerr)) { send_error(c, rerr); return true; }
+-                send_json(c, "{\"ok\":true}");
++                if (!rt_start(sess, src, options, rerr, upload)) {
++                    if (!upload.empty()) std::remove(upload.c_str());
++                    send_error(c, rerr); return true;
++                }
++                send_json(c, "{\"ok\":true,\"interval\":" + std::to_string(options.interval) +
++                    ",\"max_pixels\":" + std::to_string(options.max_pixels) + ",\"observe_tokens\":" +
++                    std::to_string(options.observe_tokens) + ",\"answer_tokens\":" + std::to_string(options.answer_tokens) + "}");
+                 return true;
+             }
+             if (action == "rt/stop" && req.method == "POST") {
++                {
++                    std::lock_guard<std::mutex> lk(g_rt_mu);
++                    auto it = g_rt.find(sess);
++                    if (it != g_rt.end() && it->second->model_id != id) { send_error(c, "session belongs to another model"); return true; }
++                }
+                 rt_stop(sess);
+                 send_json(c, "{\"ok\":true}");
+                 return true;
+@@ -530,24 +680,71 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+             if (action == "rt/say" && req.method == "POST") {
+                 std::lock_guard<std::mutex> lk(g_rt_mu);
+                 auto it = g_rt.find(sess);
+-                if (it == g_rt.end()) { send_error(c, "no such streaming session"); return true; }
++                if (it == g_rt.end() || it->second->model_id != id) { send_error(c, "no such streaming session"); return true; }
+                 std::string q = query_param(req.query, "q");
+-                if (q.empty()) { send_error(c, "need ?q="); return true; }
++                if (q.empty() || q.size() > 8192) { send_error(c, "need ?q= (maximum 8192 bytes)"); return true; }
+                 {
+                     std::lock_guard<std::mutex> lk2(it->second->mu);
++                    if (it->second->prompts.size() >= 8) { send_error(c, "question queue is full"); return true; }
+                     it->second->prompts.push_back(q);
++                    it->second->interrupt = true;
+                 }
++                it->second->cv.notify_all();
+                 send_json(c, "{\"ok\":true}");
+                 return true;
+             }
++            if (action == "rt/frame" && req.method == "POST") {
++                std::shared_ptr<RtStream> s;
++                { std::lock_guard<std::mutex> lk(g_rt_mu); auto it = g_rt.find(sess); if (it != g_rt.end()) s = it->second; }
++                if (!s || s->src != "browser" || s->model_id != id) { send_error(c, "no such browser streaming session"); return true; }
++                double timestamp = -1; std::string error;
++                if (!vqa::rt::read_number(query_param(req.query, "timestamp"), "timestamp", 0, 1e9, timestamp, error) || timestamp < 0) {
++                    send_error(c, "need a nonnegative finite timestamp"); return true;
++                }
++                if (req.body.empty() || req.body.size() > 20u * 1024 * 1024) { send_error(c, "frame must be 1 byte..20 MiB"); return true; }
++                vqa::MediaInput image;
++                if (!vqa::load_image_from_memory(req.body, image)) { send_error(c, "invalid JPEG or PNG frame"); return true; }
++                if (!s->push_frame(std::vector<unsigned char>(req.body.begin(), req.body.end()), timestamp)) {
++                    send_error(c, "frame timestamps must not decrease"); return true;
++                }
++                send_json(c, "{\"ok\":true}"); return true;
++            }
++            if (action == "rt/interrupt" && req.method == "POST") {
++                std::shared_ptr<RtStream> s;
++                { std::lock_guard<std::mutex> lk(g_rt_mu); auto it = g_rt.find(sess); if (it != g_rt.end()) s = it->second; }
++                if (!s || s->model_id != id) { send_error(c, "no such streaming session"); return true; }
++                s->interrupt = true;
++                s->cv.notify_all();
++                send_json(c, "{\"ok\":true}"); return true;
++            }
++            if (action == "rt/preview" && req.method == "GET") {
++                std::shared_ptr<RtStream> s;
++                { std::lock_guard<std::mutex> lk(g_rt_mu); auto it = g_rt.find(sess); if (it != g_rt.end()) s = it->second; }
++                if (!s || s->model_id != id) { send(c, "404 Not Found", "text/plain", "no stream"); return true; }
++                std::vector<unsigned char> jpg;
++                { std::lock_guard<std::mutex> lk(s->mu); jpg = s->preview; }
++                if (jpg.empty()) { send(c, "204 No Content", "image/jpeg", ""); return true; }
++                send(c, "200 OK", "image/jpeg", std::string(jpg.begin(), jpg.end())); return true;
++            }
++            if (action == "rt/status" && req.method == "GET") {
++                std::shared_ptr<RtStream> s;
++                { std::lock_guard<std::mutex> lk(g_rt_mu); auto it = g_rt.find(sess); if (it != g_rt.end()) s = it->second; }
++                if (!s || s->model_id != id) { send_error(c, "no such streaming session"); return true; }
++                std::lock_guard<std::mutex> lk(s->mu);
++                send_json(c, "{\"active\":true,\"source_ended\":" + std::string(s->source_ended ? "true" : "false") +
++                    ",\"captured_frames\":" + std::to_string(s->captured) + ",\"dropped_frames\":" + std::to_string(s->dropped) +
++                    ",\"queued_frames\":" + std::to_string(s->jpegs.size()) + ",\"last_timestamp\":" +
++                    std::to_string(s->last_timestamp) + ",\"stats\":" + stats_json(s->last_stats) + "}"); return true;
++            }
+             if (action == "rt/events" && req.method == "GET") {
+                 long since = atol(query_param(req.query, "since").c_str());
+                 std::shared_ptr<RtStream> s;
+                 {
+                     std::lock_guard<std::mutex> lk(g_rt_mu);
+                     auto it = g_rt.find(sess);
+-                    if (it != g_rt.end()) s = it->second;
++                    if (it != g_rt.end() && it->second->model_id == id) s = it->second;
+                 }
++                if (!s) { send_error(c, "no such streaming session"); return true; }
+                 std::string body;
+                 long last = since;
+                 if (s) {
+@@ -567,6 +764,9 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+         }
+ 
+         if (req.method == "POST" && action == "load") {
++            if (realtime_busy() && g_reg.loaded_id() != id) {
++                send(c, "409 Conflict", "application/json", "{\"error\":\"stop the realtime stream before changing models\"}"); return true;
++            }
+             // swap in flight: same id is idempotent, anything else conflicts
+             std::string busy_id;
+             if (swap_busy(&busy_id)) {
+@@ -600,34 +800,42 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+         if (req.method == "GET" && action == "status") {
+             // poll target for async swaps: state loading (with coarse progress
+             // bytes + elapsed) / ready / error (with the load's error text)
+-            std::string loaded_id;
+-            {   // never nested with g_swap.mu (swap_thread runs g_mu, then g_swap.mu)
+-                std::lock_guard<std::mutex> lk(g_mu);
+-                loaded_id = g_reg.loaded_id();
++            int state; std::string swap_id, swap_error;
++            uint64_t io_base; std::chrono::steady_clock::time_point t0;
++            {
++                std::lock_guard<std::mutex> lk(g_swap.mu);
++                state = g_swap.state; swap_id = g_swap.id; swap_error = g_swap.err;
++                io_base = g_swap.io_base; t0 = g_swap.t0;
+             }
+-            std::lock_guard<std::mutex> lk(g_swap.mu);
+             std::string s = "{\"id\":\"" + json_escape(id) + "\",\"loading\":";
+-            if (g_swap.state == 1 && g_swap.id == id) {
++            // Do not take the loader's model mutex while it is reading weights:
++            // status must be able to return progress during the cold load.
++            if (state == 1 && swap_id == id) {
+                 uint64_t done = 0;
+                 const uint64_t now = proc_io_read_bytes();
+-                if (now > g_swap.io_base) done = now - g_swap.io_base;
++                if (now > io_base) done = now - io_base;
+                 if (done > e->size) done = e->size;   // counter counts all I/O: clamp
+                 const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+-                    std::chrono::steady_clock::now() - g_swap.t0).count();
++                    std::chrono::steady_clock::now() - t0).count();
+                 s += "true,\"state\":\"loading\",\"bytes_done\":" + std::to_string(done) +
+                      ",\"bytes_total\":" + std::to_string(e->size) + ",\"elapsed_ms\":" +
+                      std::to_string(ms) + "}";
+-            } else if (loaded_id == id) {
+-                s += "false,\"state\":\"ready\"}";
+-            } else if (g_swap.state == 3 && g_swap.id == id) {
+-                s += "false,\"state\":\"error\",\"error\":\"" + json_escape(g_swap.err) + "\"}";
++            } else if (state == 1) {
++                s += "true,\"state\":\"loading\"}";
++            } else if (state == 3 && swap_id == id) {
++                s += "false,\"state\":\"error\",\"error\":\"" + json_escape(swap_error) + "\"}";
+             } else {
+-                s += "false,\"state\":\"idle\"}";
++                std::unique_lock<std::mutex> lk(g_mu, std::try_to_lock);
++                s += lk.owns_lock() ? (g_reg.loaded_id() == id ? "false,\"state\":\"ready\"}" : "false,\"state\":\"idle\"}")
++                                   : "false,\"state\":\"busy\"}";
+             }
+             send_json(c, s);
+             return true;
+         }
+         if (req.method == "POST" && action == "ask") {
++            if (realtime_busy()) {
++                send(c, "409 Conflict", "application/json", "{\"error\":\"a realtime stream is active; use rt/say to ask without resetting its context\"}"); return true;
++            }
+             // a swap owns g_mu for its whole read: reject fast (409) instead of
+             // blocking this connection for the load's duration
+             std::string busy_id;
+@@ -689,8 +897,20 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+                 return true;
+             }
+             vqa::GenParams gp;
+-            gp.max_tokens = atoi(query_param(req.query, "n").c_str());
+-            if (gp.max_tokens <= 0) gp.max_tokens = 256;
++            gp.max_tokens = 512;
++            double temperature = 0, top_p = 1, penalty = 1;
++            if (!vqa::rt::read_integer(query_param(req.query, "n"), "n", 1, 8192, gp.max_tokens, err) ||
++                !vqa::rt::read_integer(query_param(req.query, "max-pixels"), "max-pixels", 4096, 16777216, gp.max_pixels, err) ||
++                !vqa::rt::read_number(query_param(req.query, "temperature"), "temperature", 0, 2, temperature, err) ||
++                !vqa::rt::read_number(query_param(req.query, "top-p"), "top-p", 0.01, 1, top_p, err) ||
++                !vqa::rt::read_integer(query_param(req.query, "top-k"), "top-k", 0, 1000, gp.top_k, err) ||
++                !vqa::rt::read_number(query_param(req.query, "repeat-penalty"), "repeat-penalty", 1, 2, penalty, err) ||
++                !vqa::rt::read_integer(query_param(req.query, "repeat-last-n"), "repeat-last-n", 0, 4096, gp.repeat_last_n, err)) {
++                send_error(c, err); return true;
++            }
++            gp.temperature = (float)temperature; gp.top_p = (float)top_p; gp.repetition_penalty = (float)penalty;
++            vqa::GenStats stats;
++            gp.stats = &stats;
+             // speech output (?speak=1): only for audio-capable backends that
+             // loaded a talker; the wav lands in serve_speak.wav next to the exe
+             const char * speak_path = nullptr;
+@@ -702,18 +922,21 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+             gp.speak_wav = speak_path;
+             std::string q = query_param(req.query, "q");
+             std::string mode = query_param(req.query, "mode");
+-            if (q.empty() && media.empty()) { send_error(c, "need ?q= or a media body"); return true; }
+             // --- multi-turn sessions (?session=<id>, ?reset=1 clears) ---
+             static std::map<std::string, std::vector<std::pair<std::string, std::string>>> sessions;
++            static std::string live_session;
+             const std::string sess = query_param(req.query, "session");
+             const bool realtime = query_param(req.query, "rt") == "1";   // incremental KV session
+             if (!sess.empty() && query_param(req.query, "reset") == "1") {
+                 sessions.erase(sess);
+                 if (realtime) g_reg.loaded()->session_reset();
+             }
+-            if (sess.empty() && query_param(req.query, "reset") == "1" && q.empty()) {
++            if (query_param(req.query, "reset") == "1" && q.empty() && media.empty()) {
++                g_reg.loaded()->session_reset();
++                live_session.clear();
+                 send_json(c, "{\"ok\":true}"); return true;
+             }
++            if (q.empty() && media.empty()) { send_error(c, "need ?q= or a media body"); return true; }
+             if (realtime) {
+                 // ?sys=1 seeds the model's own streaming protocol prompt (the
+                 // three-state markers / <|silence|>); off by default so plain
+@@ -725,13 +948,10 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+                 }
+                 // the engine keeps ONE live session; a fresh HTTP session name
+                 // must reset it, otherwise turn 1 splices onto a stranger's KV
+-                static std::set<std::string> rt_sessions;
+-                if (!sess.empty() && !rt_sessions.count(sess)) {
+-                    rt_sessions.insert(sess);
++                if (!sess.empty() && live_session != id + "/" + sess) {
++                    live_session = id + "/" + sess;
+                     g_reg.loaded()->session_reset();
+                 }
+-                if (!sess.empty() && query_param(req.query, "reset") == "1")
+-                    rt_sessions.erase(sess);
+             }
+             // rebuild the conversation prefix from the stored turns (text-only:
+             // media from earlier turns is not re-sent; ask about it again)
+@@ -751,9 +971,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+             // stream state shared by the token callback and the final flush
+             static thread_local std::string carry;
+             static thread_local bool sent_any;
++            static thread_local bool client_cancelled;
+             carry.clear();
+             sent_any = false;
++            client_cancelled = false;
+             if (stream) {
++                gp.is_cancelled = [](void *) { return client_cancelled; };
+                 // NDJSON events: {"phase":"vision"} once the media is decoded,
+                 // {"t":".."} per generated piece, then {"done":true} / {"error":".."}
+                 // Chinese (any multibyte UTF-8) is often split across two tokens;
+@@ -784,7 +1007,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+                     if (emit < s.size()) { carry = s.substr(emit); s.resize(emit); }
+                     if (!s.empty()) {
+                         sent_any = true;
+-                        send_chunk_str(*(HttpSock *)ud, std::string("{\"t\":\"") + json_escape(s) + "\"}\n");
++                        if (!send_chunk_str(*(HttpSock *)ud, std::string("{\"t\":\"") + json_escape(s) + "\"}\n"))
++                            client_cancelled = true;
+                     }
+                 };
+                 gp.on_token_ud = &c;
+@@ -792,7 +1016,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+                     gp.on_stage = [](const char * stage, int done, int total, void * ud) {
+                         char ev[96];
+                         int n = snprintf(ev, sizeof(ev), "{\"stage\":\"%s\",\"done\":%d,\"total\":%d}", stage, done, total);
+-                        if (n > 0) { ev[n] = 10; ev[n+1] = 0; send_chunk_str(*(HttpSock *)ud, ev); }
++                        if (n > 0) { ev[n] = 10; ev[n+1] = 0; if (!send_chunk_str(*(HttpSock *)ud, ev)) client_cancelled = true; }
+                     };
+                     gp.on_stage_ud = &c;
+                 }
+@@ -809,6 +1033,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+                 else send_error(c, "inference failed");
+                 return true;
+             }
++            vqa::rt::Utf8Output safe_text;
++            out = safe_text.append(out);
+             // collect the talker's wav (if any) and ship it base64 inside the
+             // final event / final JSON; a missing or empty file is not an error
+             std::string wav_b64;
+@@ -823,12 +1049,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+                 // isn't left with an empty string ("未检测到目标")
+                 if (!sent_any && !out.empty())
+                     send_chunk_str(c, std::string("{\"t\":\"") + json_escape(out) + "\"}\n");
+-                send_chunk_str(c, wav_b64.empty() ? "{\"done\":true}\n"
+-                    : "{\"wav\":\"" + wav_b64 + "\",\"done\":true}\n");
++                send_chunk_str(c, "{" + (wav_b64.empty() ? std::string() : "\"wav\":\"" + wav_b64 + "\",") +
++                    "\"done\":true,\"stats\":" + stats_json(stats) + "}\n");
+                 send_stream_end(c);
+             }
+-            else send_json(c, wav_b64.empty() ? "{\"text\":\"" + json_escape(out) + "\"}"
+-                : "{\"text\":\"" + json_escape(out) + "\",\"wav\":\"" + wav_b64 + "\"}");
++            else send_json(c, "{\"text\":\"" + json_escape(out) + "\",\"stats\":" + stats_json(stats) +
++                (wav_b64.empty() ? std::string() : ",\"wav\":\"" + wav_b64 + "\"") + "}");
+             if (!sess.empty() && !q.empty())
+                 sessions[sess].push_back({q, out});   // remember the turn
+             return true;
+@@ -875,9 +1101,9 @@ std::string id_placeholder;   // set per page request before serve_page
+ 
+ namespace vqa {
+ int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
+-               const std::string & tokenizer, const char * bind_host, bool use_gpu) {
++               const std::string & tokenizer, const char * bind_host, const LoadOptions & load_options) {
+     g_web_dir = web_dir;
+-    g_use_gpu = use_gpu;   // --cpu must reach the on-demand loads (used to be swallowed)
++    g_load_options = load_options;
+     g_reg.discover(models_dir, tokenizer);   // same discovery as the MCP server
+     printf("SkyVision.cpp web UI: http://127.0.0.1:%d  (%zu models, Ctrl+C to stop)\n", port,
+            g_reg.entries().size());
+diff --git a/src/core/runtime/http_server.hpp b/src/core/runtime/http_server.hpp
+index 424e0ea..874a26e 100644
+--- a/src/core/runtime/http_server.hpp
++++ b/src/core/runtime/http_server.hpp
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <algorithm>
+ #include <cstdio>
+ #include <cstring>
+ #include <map>
+@@ -21,6 +22,7 @@
+   #include <arpa/inet.h>
+   #include <netinet/in.h>
+   #include <sys/socket.h>
++  #include <netinet/tcp.h>
+   #include <unistd.h>
+ #endif
+ 
+@@ -60,12 +62,17 @@ inline void url_decode(std::string & s) {
+ 
+ inline std::string query_param(const std::string & q, const char * key) {
+     std::string pat = std::string(key) + "=";
+-    size_t p = q.find(pat);
+-    if (p == std::string::npos) return "";
+-    size_t e = q.find('&', p);
+-    std::string v = q.substr(p + pat.size(), e == std::string::npos ? std::string::npos : e - p - pat.size());
+-    url_decode(v);
+-    return v;
++    for (size_t p = 0; p < q.size();) {
++        size_t e = q.find('&', p);
++        if (e == std::string::npos) e = q.size();
++        if (q.compare(p, pat.size(), pat) == 0) {
++            std::string v = q.substr(p + pat.size(), e - p - pat.size());
++            url_decode(v);
++            return v;
++        }
++        p = e + 1;
++    }
++    return "";
+ }
+ 
+ inline std::string json_escape(const std::string & s) {
+@@ -85,12 +92,22 @@ inline std::string json_escape(const std::string & s) {
+     return out;
+ }
+ 
++inline bool write_all(HttpSock s, const std::string & data) {
++    size_t offset = 0;
++    while (offset < data.size()) {
++        const int n = ::send(s, data.data() + offset,
++            (int)std::min<size_t>(data.size() - offset, 1u << 20), 0);
++        if (n <= 0) return false;
++        offset += (size_t)n;
++    }
++    return true;
++}
++
+ inline void send(HttpSock s, const std::string & status, const std::string & ctype, const std::string & body) {
+     std::string h = "HTTP/1.1 " + status + "\r\nContent-Type: " + ctype +
+                     "\r\nContent-Length: " + std::to_string(body.size()) +
+                     "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+-    ::send(s, h.data(), (int)h.size(), 0);
+-    ::send(s, body.data(), (int)body.size(), 0);
++    if (write_all(s, h)) write_all(s, body);
+ }
+ 
+ inline void send_json(HttpSock s, const std::string & body) { send(s, "200 OK", "application/json", body); }
+@@ -103,7 +120,7 @@ inline void send_stream_head(HttpSock s, const char * ctype) {
+     std::string h = std::string("HTTP/1.1 200 OK\r\nContent-Type: ") + ctype +
+                     "\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store"
+                     "\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+-    ::send(s, h.data(), (int)h.size(), 0);
++    write_all(s, h);
+ }
+ 
+ // returns false when the peer went away (browser tab closed / aborted fetch)
+@@ -111,7 +128,7 @@ inline bool send_chunk_str(HttpSock s, const std::string & data) {
+     char head[16];
+     snprintf(head, sizeof(head), "%zx\r\n", data.size());
+     std::string chunk = std::string(head) + data + "\r\n";
+-    return ::send(s, chunk.data(), (int)chunk.size(), 0) > 0;
++    return write_all(s, chunk);
+ }
+ 
+ inline void send_stream_end(HttpSock s) { ::send(s, "0\r\n\r\n", 5, 0); }
+@@ -190,6 +207,7 @@ inline int serve(int port, Handler handler, const char * bind_host = "127.0.0.1"
+ #endif
+         HttpSock c = ::accept(srv, (sockaddr *)&cli, &cl);
+         if (c == HTTP_INVALID) continue;
++        setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+         Request req;
+         if (!recv_all(c, req)) { http_close(c); continue; }
+         handler(c, req);
+diff --git a/src/core/vqa.hpp b/src/core/vqa.hpp
+index ec3f3f6..e0f9d08 100644
+--- a/src/core/vqa.hpp
++++ b/src/core/vqa.hpp
+@@ -37,12 +37,28 @@ struct MediaInput {
+     bool has_audio() const { return !audio.empty() && sample_rate > 0; }
+ };
+ 
++struct GenStats {
++    int generated_tokens = 0;
++    double vision_ms = 0, prefill_ms = 0, decode_ms = 0;
++    double first_token_ms = 0, total_ms = 0;
++    std::string finish_reason;
++};
++
+ struct GenParams {
+     int max_tokens = 256;
+     float temperature = 0.0f;    // 0 == greedy
+     int top_k = 0;               // 0 == disabled
+     float top_p = 1.0f;
+     int seed = -1;
++    // Optional runtime controls. Backends that do not implement them ignore them.
++    int max_pixels = 0;          // 0 = backend media-resolution default
++    float repetition_penalty = 1.0f;
++    int repeat_last_n = 128;
++    bool continuous = false;    // training-shaped realtime camera stream
++    std::string initial_prompt;
++    bool (*is_cancelled)(void * ud) = nullptr;
++    void * cancel_ud = nullptr;
++    GenStats * stats = nullptr;
+     bool stream = true;
+     void (*on_token)(const char * piece, void * ud) = nullptr;   // optional streaming sink
+     void * on_token_ud = nullptr;
+@@ -215,7 +231,7 @@ ArchInfo arch_info(const std::string & arch);
+ // to be swallowed, so a "--cpu" server still loaded weights onto the GPU).
+ int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
+                const std::string & tokenizer, const char * bind_host,
+-               bool use_gpu = true);
++               const LoadOptions & load_options = LoadOptions());
+ 
+ // MCP (Model Context Protocol) server over stdio (vqa-cli --mcp): exposes the
+ // engine as agent-facing tools. `preset_model` is an optional id / gguf path
+diff --git a/src/models/moss_vl/moss_vl_model.cpp b/src/models/moss_vl/moss_vl_model.cpp
+index 902627b..79324a9 100644
+--- a/src/models/moss_vl/moss_vl_model.cpp
++++ b/src/models/moss_vl/moss_vl_model.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include <functional>
+ #include <array>
++#include <deque>
+ 
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+@@ -130,7 +131,7 @@ public:
+     const char * name() const override { return "moss-vl-realtime"; }
+     bool ask_session(const vqa::MediaInput & media, const std::string & prompt,
+                      const vqa::GenParams & gp, std::string & out_text) override;
+-    void session_reset() override { sess_active = false; }
++    void session_reset() override { sess_active = false; recent_tokens.clear(); last_token = -1; }
+     bool ask(const vqa::MediaInput & media, const std::string & prompt,
+              const std::string & mode, const vqa::GenParams & gp, std::string & out_text) override;
+ 
+@@ -145,6 +146,12 @@ public:
+         return "<|im_start|>system\n" + sys + "<|im_end|>\n";
+     }
+     const char * silence_piece() const override { return "<|silence|>"; }
++    const char * realtime_system_prompt() const override {
++        return "You are a helpful AI assistant specializing in real-time video analysis. "
++               "The video streams to you frame by frame. At every frame, you decide independently "
++               "whether to respond or stay silent — output `<|silence|>` when nothing relevant has happened, "
++               "and respond when the visual content warrants it.";
++    }
+ 
+     // tunables, set before load()
+     int n_ctx = 8192;
+@@ -158,7 +165,7 @@ private:
+     bool alloc_kv();
+     bool prepare_media(const vqa::MediaInput & media, int token_budget,
+                        std::vector<float> & patches, std::vector<float> & pos,
+-                       std::vector<int> & vpos, int * gh, int * gw);
++                       std::vector<int> & vpos, int * gh, int * gw, int max_pixels_override = 0);
+     bool build_prompt(const vqa::MediaInput & media, const std::string & user_text,
+                       const std::vector<int> & grids, PromptPlan & plan,
+                       const std::string & history = "");
+@@ -179,6 +186,8 @@ private:
+     bool run_text(TextGraph & g, const PromptPlan & plan, const std::vector<int> & toks,
+                   int base_slot, std::vector<float> & logits_out);
+     int sample(const std::vector<float> & logits, const vqa::GenParams & gp);
++    bool decode_turn(TextGraph & g, const PromptPlan & plan, std::vector<float> & logits,
++                     const vqa::GenParams & gp, std::string & out_text, bool realtime);
+     void dump(const ggml_cgraph * gf, const char * name);
+     void dump_host(const char * name, const void * data, size_t bytes,
+                    std::initializer_list<int64_t> ne);
+@@ -245,7 +254,10 @@ private:
+ 
+     int id_image_pad = 151655, id_vision_start = 151652, id_vision_end = 151653;
+     int id_im_start = 151644, id_im_end = 151645, id_eos = 151645, id_endoftext = 151643;
+-    int id_silence = -1;
++    int id_silence = -1, id_ellipsis = -1;
++    int last_token = -1;
++    std::deque<int> recent_tokens;
++    struct VisionCache { uint64_t key = 0; std::vector<float> merged; } vision_cache;
+     // live realtime session state (ask_session): text KV keeps growing via
+     // n_past/rope_delta, cross-KV rows via sess_vrows.
+     // Long streams evict: the self KV keeps a pinned sink prefix (StreamingVLM
+@@ -318,6 +330,8 @@ MossVL::~MossVL() {
+     if (dec_ctx) ggml_free(dec_ctx);
+     kv.free();
+     xkv.release();
++    if (xkv_fused_buf) ggml_backend_buffer_free(xkv_fused_buf);
++    if (xkv_fused_ctx) ggml_free(xkv_fused_ctx);
+     if (wbuf) ggml_backend_buffer_free(wbuf);
+     if (wbuf_plain) ggml_backend_buffer_free(wbuf_plain);
+     if (wctx) ggml_free(wctx);
+@@ -352,6 +366,7 @@ bool MossVL::load(const std::string & gguf_path, const std::string & tokenizer_p
+         { "<|time_end|>",     &id_time_end },
+     });
+     id_silence = tok_.id_of("<|silence|>");
++    id_ellipsis = tok_.id_of("<|...|>");
+     id_eos = id_im_end;
+ 
+     caps_ = {};
+@@ -569,7 +584,7 @@ bool MossVL::alloc_kv() {
+     const int n_self = n_layer - (int)xlayers.size();
+     if (!kv.alloc(backend, n_self, n_kv_head, head_dim, n_ctx)) return false;
+     xctx = std::min(n_ctx, 32768);
+-    if (const char * e = getenv("MOSS_XCTX")) xctx = std::max(1024, atoi(e));
++    if (const char * e = getenv("MOSS_XCTX")) xctx = std::max(1024, std::min(32768, atoi(e)));
+     xkv.release();
+     const size_t bytes = (size_t)xlayers.size() * 2 * xctx * n_kv_head * head_dim * sizeof(ggml_fp16_t);
+     struct ggml_init_params ip = { ((size_t)xlayers.size() * 2 + 8) * ggml_tensor_overhead(), NULL, true };
+@@ -591,7 +606,7 @@ bool MossVL::alloc_kv() {
+ // ---------------------------------------------------------------- media prep
+ bool MossVL::prepare_media(const vqa::MediaInput & media, int token_budget,
+                            std::vector<float> & patches, std::vector<float> & pos,
+-                           std::vector<int> & vpos, int * gh, int * gw) {
++                           std::vector<int> & vpos, int * gh, int * gw, int max_pixels_override) {
+     if (media.empty()) return true;
+     const int T = (int)media.frames.size();
+     const int src_h = media.height, src_w = media.width;
+@@ -603,6 +618,7 @@ bool MossVL::prepare_media(const vqa::MediaInput & media, int token_budget,
+         if (const char * e = getenv("MOSS_VIDEO_MP")) vmp = atof(e);
+         if (vmp > 0) max_pixels = (long long)(vmp * 1e6);
+     }
++    if (max_pixels_override > 0) max_pixels = max_pixels_override;
+     if (token_budget > 0) {
+         const long long per_frame = std::max((long long)token_budget / T - 1, 4LL);   // -1 separator
+         max_pixels = std::min(max_pixels, per_frame * factor * factor);
+@@ -1488,7 +1504,81 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
+ }
+ 
+ int MossVL::sample(const std::vector<float> & logits, const vqa::GenParams & gp) {
+-    return vqa::sample_logits(logits, gp, rng_state);
++    const bool penalize = gp.repetition_penalty > 1.0f && gp.repeat_last_n > 0 && !recent_tokens.empty();
++    if (!penalize && id_ellipsis < 0) return vqa::sample_logits(logits, gp, rng_state);
++    std::vector<float> adjusted = logits;
++    // The official streaming decoder suppresses ellipsis so silence is the idle signal.
++    if (id_ellipsis >= 0 && id_ellipsis < (int)adjusted.size()) adjusted[id_ellipsis] = -INFINITY;
++    if (penalize) {
++        const int count = std::min((int)recent_tokens.size(), std::min(4096, gp.repeat_last_n));
++        std::vector<int> ids(recent_tokens.end() - count, recent_tokens.end());
++        std::sort(ids.begin(), ids.end());
++        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
++        for (int id : ids) if (id >= 0 && id < (int)adjusted.size())
++            adjusted[id] = adjusted[id] < 0 ? adjusted[id] * gp.repetition_penalty
++                                          : adjusted[id] / gp.repetition_penalty;
++    }
++    return vqa::sample_logits(adjusted, gp, rng_state);
++}
++
++bool MossVL::decode_turn(TextGraph & g, const PromptPlan & plan, std::vector<float> & logits,
++                         const vqa::GenParams & gp, std::string & out_text, bool realtime) {
++    const auto start = std::chrono::steady_clock::now();
++    int next = sample(logits, gp), emitted = 0, specials = 0;
++    std::string reason = "length";
++    out_text.clear();
++    auto consume = [&](int id) {
++        if (!run_text(g, plan, {id}, n_past, logits)) return false;
++        last_token = id;
++        return true;
++    };
++    for (int step = 0; step < gp.max_tokens; ++step) {
++        if (gp.is_cancelled && gp.is_cancelled(gp.cancel_ud)) { reason = "cancelled"; break; }
++        if (next == id_eos || next == id_endoftext) {
++            if (!consume(next)) return false;
++            reason = "stop"; break;
++        }
++        const std::string piece = tok_.decode({next});
++        if (next == id_silence) {
++            if (!consume(next)) return false;
++            reason = "silence"; break;
++        }
++        if (piece.empty() && next >= 151643) {
++            if (!consume(next)) return false;
++            if (!realtime) { reason = "stop"; break; }
++            if (++specials > 16) { reason = "special_limit"; break; }
++            next = sample(logits, gp);
++            continue;
++        }
++        if (!emitted && gp.stats) {
++            gp.stats->first_token_ms = gp.stats->vision_ms + gp.stats->prefill_ms +
++                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++        }
++        out_text += piece;
++        if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
++        ++emitted;
++        recent_tokens.push_back(next);
++        while (recent_tokens.size() > 4096) recent_tokens.pop_front();
++        // Commit EVERY emitted token, including the final token at the cap.
++        if (!consume(next)) return false;
++        if (step + 1 < gp.max_tokens) next = sample(logits, gp);
++    }
++    if (reason == "length" || reason == "cancelled" || reason == "special_limit") {
++        // A bounded / interrupted turn must not leave an unfinished continuation
++        // for the next frame. Silence is the streaming protocol's turn boundary.
++        const int end = realtime && id_silence >= 0 ? id_silence : id_im_end;
++        if (!consume(end)) return false;
++    }
++    const double ms = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - start).count();
++    if (gp.stats) {
++        gp.stats->generated_tokens = emitted;
++        gp.stats->decode_ms = ms;
++        gp.stats->finish_reason = reason;
++    }
++    fprintf(stderr, "[perf] decode %d tok in %.0f ms (%.2f tok/s), finish=%s\n",
++            emitted, ms, ms > 0 ? emitted * 1000.0 / ms : 0, reason.c_str());
++    return true;
+ }
+ 
+ // raw host-side inputs for parity (no graph tensor round trip)
+@@ -1513,16 +1603,17 @@ void MossVL::dump(const ggml_cgraph * gf, const char * name) {
+ 
+ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+                  const std::string & /*mode*/, const vqa::GenParams & gp, std::string & out_text) {
++    if (gp.stats) *gp.stats = {};
++    recent_tokens.clear();
++    last_token = -1;
++    if (gp.seed >= 0) rng_state = (uint64_t)gp.seed + 1;
+     if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
+     const auto tv0 = std::chrono::steady_clock::now();
+ 
+     // per-media cross-state cache: the tower/merger output only depends on the
+     // frame bytes; the cross-KV projection (k_norm + vision MRoPE) re-runs per
+     // ask since the frame positions t0 depend on the prompt
+-    static struct {
+-        uint64_t key = 0;
+-        std::vector<float> merged;
+-    } vcache;
++    auto & vcache = vision_cache;
+ 
+     // 1. measure the text overhead with a 1-frame probe, then size the vision
+     //    budget (like vc3: clamp or reject BEFORE the multi-second vision encode)
+@@ -1533,11 +1624,11 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+         probe.frames.resize(1);
+         PromptPlan pp;
+         const int g4[2] = {4, 4};
+-        if (!build_prompt(probe, prompt, std::vector<int>(g4, g4 + 2), pp)) return false;
++        if (!build_prompt(probe, prompt, std::vector<int>(g4, g4 + 2), pp, gp.history)) return false;
+         text_overhead = (int)pp.ids.size() + 12 * std::max(T - 1, 0);
+     }
+-    const int budget = n_ctx - gp.max_tokens - text_overhead - 16;
+-    if (budget <= 0) {
++    const int budget = xctx;
++    if (n_ctx - gp.max_tokens - text_overhead - 16 <= 0) {
+         fprintf(stderr, "n_ctx %d too small: prompt ~%d tokens + max_new %d\n",
+                 n_ctx, text_overhead, gp.max_tokens);
+         return false;
+@@ -1546,7 +1637,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+     std::vector<float> patches, pos;
+     std::vector<int> vpos;
+     int gh = 0, gw = 0;
+-    if (!prepare_media(media, budget, patches, pos, vpos, &gh, &gw)) return false;
++    if (!prepare_media(media, budget, patches, pos, vpos, &gh, &gw, gp.max_pixels)) return false;
+     std::vector<int> grids;
+     if (T > 0) {
+         const int eh = gh / vc.merge, ew = gw / vc.merge;
+@@ -1555,7 +1646,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+ 
+     PromptPlan plan;
+     if (!build_prompt(media, prompt, grids, plan, gp.history)) return false;
+-    if (plan.n_vtot + gp.max_tokens + (int)plan.ids.size() > n_ctx) {
++    if (gp.max_tokens + (int)plan.ids.size() + 16 > n_ctx || plan.n_vtot > xctx) {
+         fprintf(stderr, "n_ctx %d too small: prompt %d + vision %d + max_new %d\n",
+                 n_ctx, (int)plan.ids.size(), plan.n_vtot, gp.max_tokens);
+         return false;
+@@ -1573,6 +1664,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+             for (size_t k = 0; k < fr.rgb.size(); k++) { key ^= fr.rgb[k]; key *= 1099511628211ull; }
+         }
+         key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
++        key ^= (uint64_t)gh << 48 ^ (uint64_t)gw << 16;
+         // Both paths share ONE projection graph now: encode_vision produces
+         // only the merger output (terminal node, trustworthy readback), and
+         // the cross-KV projection always runs in project_cross_kv() - so a
+@@ -1594,6 +1686,8 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+         if (!project_cross_kv(vcache.merged, plan)) return false;
+     }
+     if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
++    if (gp.stats) gp.stats->vision_ms = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - tv0).count();
+     fprintf(stderr, "[perf] vision: %.0f ms (%d cross rows)\n",
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv0).count(),
+             plan.n_vtot);
+@@ -1604,34 +1698,10 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+     const auto t_pf0 = std::chrono::steady_clock::now();
+     if (!run_text(g, plan, plan.ids, 0, logits)) return false;
+     const auto t1 = std::chrono::steady_clock::now();
+-
+-    out_text.clear();
+-    int next = sample(logits, gp);
+-    int n_dec = 0;
+-    const int max_new = gp.max_tokens;
+-    for (int step = 0; step < max_new; step++) {
+-        if (next == id_eos || next == id_endoftext) break;
+-        // specials decode to the empty string; a stream of them is turn
+-        // machinery (silence / markers), not content — stop instead of
+-        // burning max_tokens on invisible output
+-        if (next >= 151643 && next != id_im_start && tok_.decode({next}).empty()) {
+-            fprintf(stderr, "moss_vl: stopping on empty special %d\n", next);
+-            break;
+-        }
+-        const std::string piece = tok_.decode({next});
+-        out_text += piece;
+-        if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
+-        n_dec++;
+-        if (step + 1 >= max_new) break;
+-        if (!run_text(g, plan, {next}, n_past, logits)) break;
+-        next = sample(logits, gp);
+-    }
+-    fprintf(stderr, "[perf] prefill %d tok in %.0f ms | decode %d tok in %.0f ms (%.2f tok/s)\n",
+-            (int)plan.ids.size(),
+-            std::chrono::duration<double, std::milli>(t1 - t_pf0).count(), n_dec,
+-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count(),
+-            n_dec > 0 ? n_dec * 1000.0 / std::chrono::duration<double, std::milli>(
+-                            std::chrono::steady_clock::now() - t1).count() : 0.0);
++    if (gp.stats) gp.stats->prefill_ms = std::chrono::duration<double, std::milli>(t1 - t_pf0).count();
++    if (!decode_turn(g, plan, logits, gp, out_text, false)) return false;
++    if (gp.stats) gp.stats->total_ms = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - tv0).count();
+     sess_plan = plan;      // snapshot for a session started on top of this ask
+     sess_vrows = plan.n_vtot;
+     sess_rdelta = plan.rope_delta;
+@@ -1653,13 +1723,53 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+ //   frames:      <|vision_start|><|time_start|>t<|time_end|><|image_pad|>...<|vision_end|>
+ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prompt,
+                          const vqa::GenParams & gp, std::string & out_text) {
+-    if (!sess_active) {
++    if (!sess_active && !gp.continuous) {
+         // turn 1: full prefill via the offline path, then keep the caches alive
+         if (!ask(media, prompt, "", gp, out_text)) return false;
+         sess_active = true;
+         return true;
+     }
+     const auto t0 = std::chrono::steady_clock::now();
++    if (gp.stats) *gp.stats = {};
++    double initial_prefill_ms = 0;
++    bool initial = !sess_active;
++    if (initial) {
++        // Official demo/SFT layout: prefill system + task before frames,
++        // then put live vision regions in the assistant stream after silence.
++        n_past = sess_vrows = sess_rdelta = 0;
++        last_token = -1;
++        recent_tokens.clear();
++        kv.clear();
++        xkv.clear();
++        std::string task = gp.initial_prompt;
++        if (!prompt.empty()) {
++            if (!task.empty()) task += "\n\n";
++            task += prompt;
++        }
++        std::string prelude = gp.history + "<|im_start|>user\n" + task +
++                              "<|im_end|>\n<|im_start|>assistant\n";
++        if (id_silence >= 0) prelude += "<|silence|>";
++        PromptPlan init;
++        if (!plan_from_text(prelude, {}, init)) return false;
++        if ((int)init.ids.size() + gp.max_tokens + 64 >= n_ctx) {
++            fprintf(stderr, "realtime prelude + generation exceeds context %d\n", n_ctx);
++            return false;
++        }
++        TextGraph ig;
++        std::vector<float> il;
++        if (!run_text(ig, init, init.ids, 0, il)) return false;
++        sess_plan = init;
++        sess_rdelta = init.rope_delta;
++        sess_nsink = (int)init.ids.size(); // keep the complete task/system prefix
++        if (const char * e = getenv("MOSS_RT_SINK"))
++            sess_nsink = std::max(0, std::min(atoi(e), (int)init.ids.size()));
++        sess_active = true;
++        last_token = id_silence;
++        initial_prefill_ms = std::chrono::duration<double, std::milli>(
++            std::chrono::steady_clock::now() - t0).count();
++    }
++    const auto vision_start = std::chrono::steady_clock::now();
++    if (gp.on_stage) gp.on_stage("vision", 0, 1, gp.on_stage_ud);
+ 
+     // 1. vision for the new frames (host path: incremental rows into the cache)
+     const int T_new = (int)media.frames.size();
+@@ -1667,8 +1777,10 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+     std::vector<int> vpos;
+     int gh = 0, gw = 0;
+     if (T_new > 0) {
+-        const int budget = n_ctx - n_past - gp.max_tokens - 64;
+-        if (!prepare_media(media, budget, patches, pos, vpos, &gh, &gw)) return false;
++        // Vision lives in a separate cache. Text history must not progressively
++        // shrink the incoming camera resolution or accidentally disable its cap.
++        const int budget = std::max(4, xctx - 128);
++        if (!prepare_media(media, budget, patches, pos, vpos, &gh, &gw, gp.max_pixels)) return false;
+     }
+     std::vector<int> grids;
+     if (T_new > 0) {
+@@ -1678,8 +1790,9 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+ 
+     // 2. build the splice text exactly like the official realtime loop
+     std::string text;
+-    if (!prompt.empty()) {
+-        text += "<|im_end|>\n<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
++    if (!prompt.empty() && !initial) {
++        if (last_token != id_im_end) text += "<|im_end|>";
++        text += "\n<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+         // official realtime loop inserts <|silence|> when a prompt drains
+         // alongside frames: every assistant turn in the SFT data starts with
+         // it ("confirmed with project team" in modeling_moss_vl.py). Without
+@@ -1688,17 +1801,24 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+         if (T_new > 0 && !(getenv("MOSS_RT_SILENCE") && atoi(getenv("MOSS_RT_SILENCE")) == 0))
+             text += "<|silence|>";
+     }
++    if (T_new > 0 && prompt.empty() && last_token == id_im_end)
++        text += "\n<|im_start|>assistant\n<|silence|>";
+     if (T_new > 0) {
+-        text += "<|vision_start|>";
+         for (int f = 0; f < T_new; f++) {
++            text += "<|vision_start|>";
+             char ts[64];
+             const double t = f < (int)media.timestamps.size() ? media.timestamps[f]
+                              : (media.fps > 0 ? f / media.fps : (double)f);
+             snprintf(ts, sizeof(ts), "<|time_start|>%.1f seconds<|time_end|>", t);
+             text += ts;
+             text += "<|image_pad|>";
++            text += "<|vision_end|>";
+         }
+-        text += "<|vision_end|>";
++    }
++    if (text.empty()) {
++        out_text.clear();
++        if (gp.stats) { gp.stats->finish_reason = "silence"; gp.stats->prefill_ms = initial_prefill_ms; }
++        return true;
+     }
+ 
+     // 3. plan the segment against the live caches, then make room:
+@@ -1727,17 +1847,15 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+ 
+     // 4. project the new frames' cross-KV rows (appended after the old ones)
+     if (T_new > 0) {
+-        static struct {
+-            uint64_t key = 0;
+-            std::vector<float> merged;
+-        } scache;
++        auto & scache = vision_cache;
+         uint64_t key = 1469598103934665603ull;
+         for (const auto & fr : media.frames) {
+             key ^= fr.rgb.size(); key *= 1099511628211ull;
+             for (size_t k = 0; k < fr.rgb.size(); k++) { key ^= fr.rgb[k]; key *= 1099511628211ull; }
+         }
+         key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
+-        if (scache.key == key && !scache.merged.empty() && ggml_backend_is_cpu(backend)) {
++        key ^= (uint64_t)gh << 48 ^ (uint64_t)gw << 16;
++        if (scache.key == key && !scache.merged.empty()) {
+             fprintf(stderr, "session vision: cache hit\n");
+         } else {
+             const int N = (int)(patches.size() / (3 * vc.patch * vc.patch));
+@@ -1746,57 +1864,21 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+         }
+         if (!project_cross_kv(scache.merged, seg, sess_vrows)) return false;
+     }
++    const auto prefill_start = std::chrono::steady_clock::now();
++    if (gp.stats) gp.stats->vision_ms = std::chrono::duration<double, std::milli>(
++        prefill_start - vision_start).count();
++    if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
+ 
+     // 5. prefill the segment onto the live text KV, then decode
+     TextGraph g;
+     std::vector<float> logits;
+     if (!run_text(g, seg, seg.ids, 0, logits)) return false;
+     const auto t1 = std::chrono::steady_clock::now();
+-
+-    out_text.clear();
+-    int next = sample(logits, gp);
+-    int n_dec = 0, n_special = 0;
+-    const int max_new = gp.max_tokens;
+-    for (int step = 0; step < max_new; step++) {
+-        if (next == id_eos || next == id_endoftext) break;
+-        const bool special = next >= 151643 && tok_.decode({next}).empty();
+-        if (special && next != id_silence) {
+-            // protocol markers (<|response|>, turn bookkeeping, ...) are part
+-            // of the stream: the official realtime loop feeds EVERY generated
+-            // token back and keeps decoding - breaking here would cut off the
+-            // answer the model is about to speak (turn 2+ opens with
+-            // <|response|>). A long run of specials with no content ends the
+-            // turn in spirit; stop instead of burning the token budget.
+-            if (getenv("MOSS_RT_DEBUG")) {
+-                std::vector<std::pair<float, int>> top(logits.size());
+-                for (int i = 0; i < (int)logits.size(); i++) top[i] = {logits[i], i};
+-                std::partial_sort(top.begin(), top.begin() + 5, top.end(),
+-                                  [](auto & a, auto & b) { return a.first > b.first; });
+-                fprintf(stderr, "[rt-dbg] special %d; top5:", next);
+-                for (int i = 0; i < 5; i++)
+-                    fprintf(stderr, " %d(%.2f)", top[i].second, top[i].first);
+-                fprintf(stderr, "\n");
+-            }
+-            if (++n_special > 8 || !run_text(g, seg, {next}, n_past, logits)) break;
+-            next = sample(logits, gp);
+-            continue;
+-        }
+-        if (special /* <|silence|>: the idle signal */) {
+-            run_text(g, seg, {next}, n_past, logits);
+-            break;
+-        }
+-        const std::string piece = tok_.decode({next});
+-        out_text += piece;
+-        if (gp.on_token) gp.on_token(piece.c_str(), gp.on_token_ud);
+-        n_dec++;
+-        if (step + 1 >= max_new) break;
+-        if (!run_text(g, seg, {next}, n_past, logits)) break;
+-        next = sample(logits, gp);
+-    }
+-    fprintf(stderr, "[perf] session turn: prefill %d tok in %.0f ms | decode %d tok in %.0f ms\n",
+-            (int)seg.ids.size(),
+-            std::chrono::duration<double, std::milli>(t1 - t0).count(), n_dec,
+-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
++    if (gp.stats) gp.stats->prefill_ms = initial_prefill_ms +
++        std::chrono::duration<double, std::milli>(t1 - prefill_start).count();
++    if (!decode_turn(g, seg, logits, gp, out_text, true)) return false;
++    if (gp.stats) gp.stats->total_ms = std::chrono::duration<double, std::milli>(
++        std::chrono::steady_clock::now() - t0).count();
+     // carry the session forward: decode positions continue via seg.rope_delta
+     sess_plan = seg;
+     sess_vrows = seg.n_vtot;

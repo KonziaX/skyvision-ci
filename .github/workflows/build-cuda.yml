@@ -6,26 +6,37 @@ on:
 permissions:
   contents: read
 
+env:
+  SKYVISION_REF: a4822e5065a08f1198b9d6b1cffc274626172bd1
+  GGML_REF: cd6d2b75f5d3e4b2f3fe8e8fbc6c8b84ac80e74a
+  CUDA_ARCH: "120"
+
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Clone SkyVision.cpp and ggml
+      - name: Fetch pinned sources and apply runtime patch
         shell: pwsh
         run: |
-          git clone --depth 1 https://github.com/SkYContact/SkyVision.cpp.git skyvision
-          git clone --depth 1 https://github.com/ggml-org/ggml.git skyvision/ggml
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: "13.0.0"
-          method: local
+          git init skyvision
+          git -C skyvision config core.autocrlf false
+          git -C skyvision remote add origin https://github.com/SkYContact/SkyVision.cpp.git
+          git -C skyvision fetch --depth 1 origin $env:SKYVISION_REF
+          git -C skyvision checkout --detach FETCH_HEAD
+          git init skyvision/ggml
+          git -C skyvision/ggml config core.autocrlf false
+          git -C skyvision/ggml remote add origin https://github.com/ggml-org/ggml.git
+          git -C skyvision/ggml fetch --depth 1 origin $env:GGML_REF
+          git -C skyvision/ggml checkout --detach FETCH_HEAD
+          git -C skyvision apply --check ../patches/moss-runtime.patch
+          if ($LASTEXITCODE -ne 0) { throw "Runtime patch does not match the pinned source" }
+          git -C skyvision apply ../patches/moss-runtime.patch
+          if ($LASTEXITCODE -ne 0) { throw "Runtime patch failed" }
 
       - name: Locate MSVC toolchain
         shell: pwsh
@@ -34,30 +45,31 @@ jobs:
           $vs = [string](& $vswhere -latest -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath | Select-Object -First 1)
-
-          if (-not $vs) {
-            throw "Visual Studio C++ toolchain was not found"
-          }
-
+          if (-not $vs) { throw "Visual Studio C++ toolchain was not found" }
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-          $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" `
-            -File -ErrorAction SilentlyContinue |
-            Sort-Object FullName |
-            Select-Object -Last 1
+          $cl = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe" -File |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not (Test-Path $vcvars) -or -not $cl) { throw "MSVC compiler was not found" }
+          @("VCVARS=$vcvars", "CUDA_HOST_CL=$($cl.FullName)") |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          if (-not (Test-Path $vcvars)) {
-            throw "vcvars64.bat was not found"
-          }
+      - name: Validate C++ before the expensive CUDA build
+        shell: cmd
+        run: |
+          call "%VCVARS%" >nul
+          cl /nologo /utf-8 /std:c++17 /EHsc /Zs /I skyvision\src /I skyvision\ggml\include /I skyvision\src\models\moondream /I skyvision\src\models\moss_vl skyvision\src\cli\vqa_cli.cpp skyvision\src\cli\vqa_server.cpp skyvision\src\models\moss_vl\moss_vl_model.cpp
+          if errorlevel 1 exit /b 1
+          if not exist work mkdir work
+          cl /nologo /utf-8 /std:c++17 /EHsc /I skyvision\src tests\realtime_options_test.cpp /Fe:work\realtime-options-test.exe /Fo:work\realtime-options-test.obj /link ws2_32.lib
+          if errorlevel 1 exit /b 1
+          work\realtime-options-test.exe
+          if errorlevel 1 exit /b 1
 
-          if (-not $cl) {
-            throw "cl.exe was not found"
-          }
-
-          @(
-            "VCVARS=$vcvars"
-            "CUDA_HOST_CL=$($cl.FullName)"
-            "CUDA_ARCH=120"
-          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "13.0.0"
+          method: local
 
       - name: Verify build tools
         shell: pwsh
@@ -65,63 +77,58 @@ jobs:
           cmake --version
           ninja --version
           nvcc --version
-          Write-Host "VCVARS=$env:VCVARS"
-          Write-Host "CUDA_HOST_CL=$env:CUDA_HOST_CL"
 
-      - name: Build vqa-cli
+      - name: Build vqa-cli for RTX 50 with CUDA graphs
         shell: cmd
         working-directory: skyvision
         run: |
-          set "CUDA_ARCH=120"
           call scripts\build-cuda.bat
+          if errorlevel 1 exit /b 1
 
-      - name: Package executable and CUDA runtime
+      - name: Package executable, web assets and CUDA runtime
         shell: pwsh
         run: |
           $package = Join-Path $env:GITHUB_WORKSPACE "package"
           $build = Join-Path $env:GITHUB_WORKSPACE "skyvision\build-cuda"
-
           New-Item -ItemType Directory -Force $package | Out-Null
-
-          $exe = Get-ChildItem $build -Filter vqa-cli.exe -Recurse -File |
-            Select-Object -First 1
-
-          if (-not $exe) {
-            throw "vqa-cli.exe was not produced"
+          $exe = Get-ChildItem $build -Filter vqa-cli.exe -Recurse -File | Select-Object -First 1
+          if (-not $exe) { throw "vqa-cli.exe was not produced" }
+          Copy-Item $exe.FullName $package
+          foreach ($name in @("cublas64_13.dll", "cublasLt64_13.dll", "cudart64_13.dll", "nvJitLink_130_0.dll")) {
+            $dll = Get-ChildItem $env:CUDA_PATH -Recurse -Filter $name -File | Select-Object -First 1
+            if (-not $dll) { throw "CUDA DLL not found: $name" }
+            Copy-Item $dll.FullName $package
           }
+          Copy-Item skyvision\web (Join-Path $package "web") -Recurse
+          Copy-Item README.md (Join-Path $package "README.md")
+          [ordered]@{
+            skyvision_ref = $env:SKYVISION_REF
+            ggml_ref = $env:GGML_REF
+            ci_ref = $env:GITHUB_SHA
+            cuda = "13.0.0"
+            cuda_arch = $env:CUDA_ARCH
+            cuda_graphs = $true
+            runtime_api = 2
+            patch_sha256 = (Get-FileHash patches\moss-runtime.patch -Algorithm SHA256).Hash.ToLower()
+            executable_sha256 = (Get-FileHash (Join-Path $package "vqa-cli.exe") -Algorithm SHA256).Hash.ToLower()
+            built_utc = [DateTime]::UtcNow.ToString("o")
+          } | ConvertTo-Json | Set-Content (Join-Path $package "build-info.json") -Encoding utf8
 
-          Copy-Item $exe.FullName $package -Force
-
-          # CUDA 13 runtime DLLs
-          $cudaDllNames = @(
-            "cublas64_13.dll",
-            "cublasLt64_13.dll",
-            "cudart64_13.dll",
-            "nvJitLink_130_0.dll"
-          )
-
-          foreach ($name in $cudaDllNames) {
-            $dll = Get-ChildItem $env:CUDA_PATH -Recurse `
-              -Filter $name -File -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-
-            if (-not $dll) {
-              throw "CUDA DLL not found: $name"
-            }
-
-            Copy-Item $dll.FullName $package -Force
+      - name: Smoke test packaged binary
+        shell: pwsh
+        working-directory: package
+        run: |
+          .\vqa-cli.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "Packaged executable or a runtime DLL is broken" }
+          $specs = .\vqa-cli.exe --specs | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not ($specs | Where-Object { $_.arch -eq "moss_vl" })) {
+            throw "MOSS backend is missing"
           }
-
-          @"
-          SkyVision.cpp CUDA build
-          Target GPU architecture: RTX 50 / sm_120
-          Model files are not included.
-          "@ | Set-Content "$package\README.txt" -Encoding utf8
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: skyvision-windows-cuda
+          name: skyvision-windows-cuda-runtime
           path: package
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14

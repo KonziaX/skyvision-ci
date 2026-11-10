@@ -1,0 +1,8 @@
+skyvision/
+work/
+package/
+skyvision-windows-cuda*/
+skyvision-windows-cuda*.zip
+*.gguf
+tokenizer.json
+__pycache__/

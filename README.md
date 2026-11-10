@@ -1,0 +1,81 @@
+# SkyVision MOSS runtime build
+
+Windows x64 / CUDA 13.0 / RTX 50 (`sm_120`). The workflow pins both upstream
+repositories and applies `patches/moss-runtime.patch` before compiling. Editing
+the separately cloned frontend repository does not change this build.
+
+The patch exposes the MOSS runtime controls, corrects realtime initialization,
+commits the final generated token and a turn boundary on capped/interrupted
+turns, bounds the camera queue to recent frames, and accepts browser JPEG/PNG
+frames. CUDA graphs and flash attention remain enabled. Model dimensions and
+token identifiers still come from the GGUF/tokenizer; do not change them as
+performance knobs.
+
+## Start
+
+Use the downloaded executable with the original frontend checkout:
+
+```powershell
+& ./vqa-cli.exe --models-dir /path/to/models --tokenizer /path/to/tokenizer.json `
+  --web-dir /path/to/SkyVision.cpp/web --n-ctx 4096 --serve 8899
+```
+
+The 12 GB laptop GPU profile uses 4096 self-cache tokens. `MOSS_XCTX` controls
+visual-cache rows (1024..32768, defaults to the context size). Increasing these
+values costs VRAM; neither needs a recompile. `--threads` and `--cpu` also reach
+server loads now. The package includes CUDA DLLs and a base `web` directory;
+models/tokenizers and FFmpeg are separate. The enhanced MOSS page is maintained
+in the local frontend repository. Windows console output is UTF-8 automatically.
+
+## Runtime API
+
+`GET /api/runtime` returns API version 2 and server load options.
+
+`POST /api/model/<id>/rt/start?session=<id>&src=<source>` accepts:
+
+| Query | Default | Meaning |
+| --- | --- | --- |
+| `interval` | 1 | Sampling interval in seconds, 0.2..60 |
+| `frames` | 1 | Most recent frames per inference, 1..8 |
+| `n` | 512 | User-answer token cap |
+| `observe-n` | 128 | Autonomous-observation token cap |
+| `max-pixels` | 262144 | Per-frame inference pixel budget |
+| `temperature`, `top-k`, `top-p` | 0, 0, 1 | Greedy or sampling settings |
+| `repeat-penalty`, `repeat-last-n` | 1.05, 128 | Recent text repetition control |
+| `video-size` | 1920x1080 | DirectShow input resolution; `auto` uses device default |
+| `capture-fps` | 30 | DirectShow input FPS; independent of inference sampling |
+| `pixel-format` | auto | DirectShow format, e.g. `yuyv422` |
+| `warmup` | 2 | Camera-only trim in seconds, independent of input FPS |
+| `jpeg-quality` | 2 | FFmpeg MJPEG quality, 1..31 |
+| `sys` | 1 | Use the official training-shaped realtime system prompt |
+| `system-prompt`, `prompt` | official / concise Chinese task | Runtime prompt overrides |
+
+`src=browser` enables external frames through
+`POST .../rt/frame?session=<id>&timestamp=<seconds>`, with JPEG/PNG bytes as the
+body. Timestamps must be finite, nonnegative and nondecreasing.
+
+`rt/say?q=...` wakes the worker immediately and interrupts its current response.
+`rt/interrupt` interrupts without resetting the KV session; `rt/stop` ends the
+stream. `rt/preview`, `rt/status`, and `rt/events?since=<seq>` provide the actual
+sampled frame, bounded-queue counts, and incremental output. One live stream
+owns the resident model; conflicting offline asks/model swaps receive 409.
+
+Single/multi-turn `ask` accepts `n`, `max-pixels`, sampling and repetition
+settings too. Streaming completion events carry actual token counts, first-token
+latency, vision/prefill/decode times, and `finish_reason`. `length` explicitly
+means a user-configured output cap; the runtime still closes the turn in KV.
+
+Existing environment overrides remain available: `MOSS_VIDEO_MP`, `MOSS_XCTX`,
+`MOSS_RT_SINK`, `MOSS_RT_SILENCE`, `MOSS_NO_STATIC`, and `MOSS_DUMP_DIR`.
+Keep static decode enabled and tensor dumping disabled for normal inference.
+
+## Reproduce or change C++
+
+The local `skyvision/` checkout is ignored and is the place to edit compiled
+sources. Export its diff to `patches/moss-runtime.patch`, review the diff, and
+commit/push the workflow repository. The workflow checks patch compatibility
+and runs syntax/UTF-8/option/argument-quoting tests before installing CUDA or
+starting the expensive build. `build-info.json` records source refs, patch and
+binary hashes. Runtime setting changes need no code edits or rebuilding.
+
+Protocol reference: [MOSS realtime documentation](https://github.com/OpenMOSS/MOSS-VL/blob/main/inference/realtime/README.md).
