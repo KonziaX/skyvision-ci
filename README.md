@@ -28,6 +28,12 @@ server loads now. The package includes CUDA DLLs and a base `web` directory;
 models/tokenizers and FFmpeg are separate. The enhanced MOSS page is maintained
 in the local frontend repository. Windows console output is UTF-8 automatically.
 
+`scripts/install-runtime-artifact.py` verifies the pinned source refs, patch hash,
+binary hash and CUDA settings before extracting a GitHub artifact. Pass
+`--archive`, `--dest` (a new folder inside this repository), and
+`--expected-commit` (the workflow run's full commit SHA). It refuses existing
+destinations, path traversal, ZIP links and duplicate filenames.
+
 ## Runtime API
 
 `GET /api/runtime` returns API version 2 and server load options.
@@ -83,7 +89,17 @@ Local real-model checks also cover a forced two-token cutoff and recovery,
 realtime question interruption, bounded queues, and repeated text-only turns
 that force eviction in a 1024-token context. Run `tests/runtime_smoke.py` with
 explicit binary/model/web paths; add `--context 1024 --cross-rows 1024 --long-cache`
-to exercise the eviction boundary. Model tests need Pillow and the user's GGUF;
+to exercise the eviction boundary. `--visual-cache` fills the visual window,
+changes the blue circle to green, and checks the newest image after eviction.
+For an 8192-row visual window use `--visual-frames 50`.
+Model tests need Pillow and the user's GGUF;
 they use deterministic colored shapes rather than a live camera.
+
+`tests/media_source_smoke.py` checks Chinese/space-containing FFmpeg source paths,
+video EOF, preview decoding, upload cleanup, owned-child shutdown and early HTTP
+disconnects. It also verifies the two-second camera filter against generated
+30/60 FPS sources; it does not access a real camera. `tests/benchmark_backend.py`
+compares retained/rebuilt binaries using the same image and question. These
+scripts write reports and logs under the explicitly selected output directory.
 
 Protocol reference: [MOSS realtime documentation](https://github.com/OpenMOSS/MOSS-VL/blob/main/inference/realtime/README.md).

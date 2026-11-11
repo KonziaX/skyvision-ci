@@ -1,6 +1,7 @@
 """Measure the retained old binary and the rebuilt binary with the same fixture."""
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -9,6 +10,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+
+
+def gpu_memory():
+    try:
+        result = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total",
+            "--format=csv,noheader,nounits"], capture_output=True, text=True, check=True, timeout=5)
+        return [{"used_mib": int(row.split(",")[0]), "total_mib": int(row.split(",")[1])}
+                for row in result.stdout.strip().splitlines()]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 def main():
@@ -30,10 +41,12 @@ def main():
     log = log_path.open("wb")
     command = [str(binary), "--models-dir", str(pathlib.Path(args.models_dir).resolve()),
                "--serve", str(args.port), "--n-ctx", "4096"]
+    baseline_memory = gpu_memory()
     process = subprocess.Popen(command, cwd=work, stdout=log, stderr=subprocess.STDOUT,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     result = {"label": args.label, "binary": str(binary), "requested_n_ctx": 4096,
-              "max_pixels": args.pixels, "trials": [], "server_log": str(log_path)}
+              "max_pixels": args.pixels, "trials": [], "server_log": str(log_path),
+              "requested_cross_rows": os.getenv("MOSS_XCTX"), "gpu_baseline": baseline_memory}
 
     def request(path, body=None):
         return urllib.request.urlopen(urllib.request.Request(root + path, data=body), timeout=180)
@@ -67,6 +80,7 @@ def main():
                 raise RuntimeError(state.get("error"))
             time.sleep(0.2)
         result["load_status_max_ms"] = max(latency, default=0)
+        result["gpu_loaded"] = gpu_memory()
         media = pathlib.Path(args.image).read_bytes()
         for trial in range(3):
             # n precedes session, so the old substring-based parser receives
@@ -93,6 +107,7 @@ def main():
             assert text and "\ufffd" not in text
             result["trials"].append({"trial": trial + 1, "first_token_ms": first,
                                      "total_ms": elapsed, "text": text, "stats": stats})
+        result["gpu_after_inference"] = gpu_memory()
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     finally:
         process.terminate()

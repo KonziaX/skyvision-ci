@@ -14,17 +14,17 @@ import uuid
 from PIL import Image, ImageDraw, ImageFont
 
 
-def fixture():
+def fixture(circle=(30, 75, 225), circle_label="BLUE CIRCLE"):
     image = Image.new("RGB", (1280, 720), "white")
     draw = ImageDraw.Draw(image)
     draw.rectangle((80, 140, 530, 580), fill=(230, 35, 35))
-    draw.ellipse((740, 140, 1180, 580), fill=(30, 75, 225))
+    draw.ellipse((740, 140, 1180, 580), fill=circle)
     try:
         font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 62)
     except OSError:
         font = ImageFont.load_default(size=62)
     draw.text((180, 610), "RED BOX", fill="black", font=font)
-    draw.text((785, 610), "BLUE CIRCLE", fill="black", font=font)
+    draw.text((785, 610), circle_label, fill="black", font=font)
     result = io.BytesIO()
     image.save(result, format="JPEG", quality=95)
     return result.getvalue()
@@ -40,9 +40,13 @@ def main():
     parser.add_argument("--context", type=int, default=4096)
     parser.add_argument("--cross-rows", type=int)
     parser.add_argument("--long-cache", action="store_true")
+    parser.add_argument("--visual-cache", action="store_true")
+    parser.add_argument("--visual-frames", type=int, default=24)
     parser.add_argument("--runtime-dir", help="Optional compiler/runtime DLL directory for local CPU builds")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
+    if not 1 <= args.visual_frames <= 256:
+        parser.error("--visual-frames must be 1..256")
     report_path = pathlib.Path(args.output).resolve()
     run_dir = report_path.parent / ("smoke-" + uuid.uuid4().hex[:10])
     run_dir.mkdir(parents=True)
@@ -184,12 +188,31 @@ def main():
         assert any(word in rt_text.lower() for word in ("蓝", "blue")), "Realtime visual context was lost"
         report["tests"]["realtime_question"] = {"text": rt_text, "stats": answer.get("stats")}
 
+        timestamp_base = 0
+        if args.visual_cache:
+            # Repeated frames fill and evict cross-KV. Then change the image:
+            # the newest frame must win, with no stale GPU feature-cache reuse.
+            green = fixture((30, 175, 75), "GREEN CIRCLE")
+            observation_stats = []
+            for timestamp in range(1, args.visual_frames + 1):
+                obj(api + "/rt/frame", {"session": live, "timestamp": timestamp}, green if timestamp == args.visual_frames else image)
+                observed = poll_until(lambda event: event.get("event") in ("turn_end", "silence"))
+                observation_stats.append(observed.get("stats"))
+            obj(api + "/rt/say", {"session": live, "q": "现在右侧圆形是什么颜色？请只回答当前颜色名称。"}, b"")
+            before = len(events)
+            poll_until(lambda event: event.get("event") == "ask")
+            latest = poll_until(lambda event: event.get("event") in ("turn_end", "silence"))
+            latest_text = "".join(event.get("t", "") for event in events[before:])
+            assert any(word in latest_text.lower() for word in ("绿", "green")), "Latest vision was lost after cross-KV eviction"
+            report["tests"]["visual_cache_eviction"] = {"frames": args.visual_frames, "latest_answer": latest_text,
+                "stats": latest.get("stats"), "last_observations": observation_stats[-6:]}
+            timestamp_base = args.visual_frames
         for timestamp in range(1, 7):
-            obj(api + "/rt/frame", {"session": live, "timestamp": timestamp}, image)
+            obj(api + "/rt/frame", {"session": live, "timestamp": timestamp_base + timestamp}, image)
         status, elapsed = obj(api + "/rt/status", {"session": live}, timeout=5)
         assert status["queued_frames"] <= 1 and status["dropped_frames"] > 0, "Frame backlog was not bounded"
         report["tests"]["bounded_queue"] = {"status": status, "status_latency_ms": elapsed}
-        obj(api + "/rt/frame", {"session": live, "timestamp": 5.5}, image, expect=400)
+        obj(api + "/rt/frame", {"session": live, "timestamp": timestamp_base + 5.5}, image, expect=400)
         obj(api + "/rt/interrupt", {"session": live}, b"")
         _, stop_ms = obj(api + "/rt/stop", {"session": live}, b"", timeout=30)
         report["tests"]["stop_ms"] = stop_ms
