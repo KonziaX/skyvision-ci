@@ -121,6 +121,14 @@ steady-state growth after warmup. Use at least 600 frames to exceed the 480-turn
 failure seen with the old static graph owner; `--frames 1000` covers repeated
 visual-cache compaction. `--disable-static` and `--disable-cuda-graphs` are
 diagnostic controls for retained old binaries, not normal deployment defaults.
+`--recover-repeats` enables the opt-in loop recovery. Add
+`--stop-after-recovery` to ask immediately after its first trigger, without
+uploading another frame; this mode requires a recovery and a visible answer.
+The ordinary long-stream pass measures memory safety and completed turns, not
+answer accuracy; its final answer and finish reason are reported separately.
 Video bytes and generated frames stay local; do not upload them to Actions.
+
+The installed CUDA build and local regression results for the static-context
+leak are recorded in [the repair validation](docs/moss-crash-fix-validation.md).
 
 Protocol reference: [MOSS realtime documentation](https://github.com/OpenMOSS/MOSS-VL/blob/main/inference/realtime/README.md).

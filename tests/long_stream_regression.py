@@ -60,6 +60,8 @@ def main():
     parser.add_argument("--repeat-penalty", type=float, default=1.05)
     parser.add_argument("--repeat-window", type=int, default=128)
     parser.add_argument("--recover-repeats", action="store_true")
+    parser.add_argument("--stop-after-recovery", action="store_true",
+                        help="Ask immediately after the first recovery with no new video frame")
     parser.add_argument("--max-observation-copies", type=int,
                         help="Optional failure threshold for identical nonempty observations")
     parser.add_argument("--cpu", action="store_true")
@@ -69,6 +71,8 @@ def main():
         parser.error("Memory monitoring requires Windows")
     if not 1 <= args.frames <= 4000:
         parser.error("frames must be 1..4000")
+    if args.stop_after_recovery and not args.recover_repeats:
+        parser.error("stop-after-recovery requires recover-repeats")
     report_path = pathlib.Path(args.output).resolve()
     if report_path.exists():
         raise FileExistsError(report_path)
@@ -207,7 +211,9 @@ def main():
             if growth > args.memory_growth_limit_mib:
                 raise RuntimeError("Safety stop: private memory growth exceeded " +
                                    str(args.memory_growth_limit_mib) + " MiB")
-        # Check meaningful latest-frame answers and responsiveness after many compactions.
+            if args.stop_after_recovery and report["recoveries"]:
+                break
+        # Record the final answer separately from the memory/processing checks.
         obj(api + "/rt/say", {"session": session,
             "q": "请用一句话描述最新画面中的主要物体或人物，不确定时明确说明。"}, b"")
         deadline = time.monotonic() + 180
@@ -228,6 +234,11 @@ def main():
             if not final_event:
                 time.sleep(0.035)
         report["final_question"] = {"text": final_text, "stats": final_event.get("stats")}
+        if args.stop_after_recovery:
+            if not report["recoveries"]:
+                raise RuntimeError("No repeated-observation recovery was triggered")
+            if not final_text.strip():
+                raise RuntimeError("Question after recovery did not receive a visible answer")
         from collections import Counter
         observations = [turn["text"] for turn in report["turns"] if turn["text"]]
         counts = Counter(observations)
