@@ -51,6 +51,7 @@ destinations, path traversal, ZIP links and duplicate filenames.
 | `max-pixels` | 262144 | Per-frame inference pixel budget |
 | `temperature`, `top-k`, `top-p` | 0, 0, 1 | Greedy or sampling settings |
 | `repeat-penalty`, `repeat-last-n` | 1.05, 128 | Recent text repetition control |
+| `recover-repeats` | 0 | Opt-in short-context recovery when one autonomous observation appears 3 times in the latest 64 nonempty observations |
 | `video-size` | 1920x1080 | DirectShow input resolution; `auto` uses device default |
 | `capture-fps` | 30 | DirectShow input FPS; independent of inference sampling |
 | `pixel-format` | auto | DirectShow format, e.g. `yuyv422` |
@@ -68,6 +69,14 @@ body. Timestamps must be finite, nonnegative and nondecreasing.
 stream. `rt/preview`, `rt/status`, and `rt/events?since=<seq>` provide the actual
 sampled frame, bounded-queue counts, and incremental output. One live stream
 owns the resident model; conflicting offline asks/model swaps receive 409.
+
+`recover-repeats=1` keeps the capture process, original task and latest user
+question while retiring old model history when repeated observations dominate
+the window. The next frame starts a fresh model context; the last sampled frame
+is also available to questions after video EOF. A `session_recovered` event
+explicitly informs the client that older conversation/visual history was cleared.
+User-answer repetitions do not trigger recovery. The rapid-motion frontend
+preset opts in; history-sensitive use can leave it off.
 
 Single/multi-turn `ask` accepts `n`, `max-pixels`, sampling and repetition
 settings too. Streaming completion events carry actual token counts, first-token

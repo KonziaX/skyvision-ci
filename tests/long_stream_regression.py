@@ -59,6 +59,9 @@ def main():
     parser.add_argument("--prompt", help="Override the initial observation task for diagnosis")
     parser.add_argument("--repeat-penalty", type=float, default=1.05)
     parser.add_argument("--repeat-window", type=int, default=128)
+    parser.add_argument("--recover-repeats", action="store_true")
+    parser.add_argument("--max-observation-copies", type=int,
+                        help="Optional failure threshold for identical nonempty observations")
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
@@ -113,7 +116,7 @@ def main():
     report = {"passed": False, "requested_frames": args.frames, "source_video": str(pathlib.Path(args.video).resolve()),
               "binary": command[0], "cross_rows": args.cross_rows, "context": args.context,
               "static_decode": not args.disable_static, "cuda_graphs": not args.disable_cuda_graphs,
-              "cpu": args.cpu, "turns": [], "memory": [], "run_dir": str(run_dir)}
+              "cpu": args.cpu, "turns": [], "memory": [], "recoveries": [], "run_dir": str(run_dir)}
     session = "regression-" + uuid.uuid4().hex[:12]
     process = None
     job = None
@@ -141,6 +144,8 @@ def main():
                     raise
                 time.sleep(0.1)
         entries = obj("/api/models")["models"]
+        if args.recover_repeats and not runtime.get("recover_repeats"):
+            raise RuntimeError("Selected runtime does not support repeated-observation recovery")
         model = next(row for row in entries if row["arch"] == "moss_vl")
         api = "/api/model/" + urllib.parse.quote(model["id"], safe="")
         status = obj(api + "/load", body=b"")
@@ -157,6 +162,7 @@ def main():
                     "n": 128, "observe-n": args.observe_tokens, "max-pixels": args.pixel_budget,
                     "temperature": 0, "top-k": 0, "top-p": 1, "repeat-penalty": args.repeat_penalty,
                     "repeat-last-n": args.repeat_window, "sys": 1,
+                    "recover-repeats": 1 if args.recover_repeats else 0,
                     "prompt": "请关注画面中明显的动作、物体进入离开和位置变化，用一句中文简短报告与用户问题相关的新变化。没有新变化或已经回答完毕时输出 <|silence|>，不要重复描述静止画面。"}
         if args.prompt is not None:
             settings["prompt"] = args.prompt
@@ -178,6 +184,8 @@ def main():
                 for line in raw.splitlines():
                     event = json.loads(line)
                     seq = max(seq, event.get("seq", 0))
+                    if event.get("event") == "session_recovered":
+                        report["recoveries"].append({"turn": index + 1, **event})
                     if "error" in event:
                         raise RuntimeError(event)
                     text += event.get("t", "")
@@ -225,6 +233,9 @@ def main():
         counts = Counter(observations)
         report["observation_counts"] = {"nonempty": len(observations), "unique": len(counts),
             "most_frequent_count": max(counts.values(), default=0)}
+        if args.max_observation_copies is not None and counts:
+            if max(counts.values()) > args.max_observation_copies:
+                raise RuntimeError("Identical observation exceeded the regression copy limit")
         report["passed"] = True
         report["final_private_mib"] = report["memory"][-1]["private_mib"]
         if len(report["memory"]) >= 40:

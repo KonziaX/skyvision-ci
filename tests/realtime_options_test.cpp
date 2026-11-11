@@ -15,6 +15,13 @@ int main() {
     Options o; std::string error;
     check(parse_options(get, o, error), "defaults must be usable");
     check(o.frames == 1 && o.observe_tokens < o.answer_tokens, "bounded realtime defaults");
+    check(!o.recover_repeats, "history recovery must be opt-in");
+    input = {{"recover-repeats", "1"}};
+    check(parse_options(get, o, error) && o.recover_repeats, "repeated-observation recovery opt-in");
+    input = {{"recover-repeats", "2"}}; error.clear();
+    check(!parse_options(get, o, error), "invalid recovery switches must be rejected");
+    input = {{"recover-repeats", "0"}}; error.clear();
+    check(parse_options(get, o, error) && !o.recover_repeats, "recovery can preserve full history");
     input = {{"interval", "1.5"}, {"video-size", "1920x1080"}, {"capture-fps", "60"},
              {"n", "1024"}, {"observe-n", "256"}, {"warmup", "2.5"}, {"max-pixels", "524288"}};
     check(parse_options(get, o, error) && o.answer_tokens == 1024 && o.capture_fps == 60 && o.warmup == 2.5,

@@ -1,9 +1,9 @@
 diff --git a/src/cli/realtime_options.hpp b/src/cli/realtime_options.hpp
 new file mode 100644
-index 0000000..3504349
+index 0000000..c06161b
 --- /dev/null
 +++ b/src/cli/realtime_options.hpp
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,158 @@
 +#pragma once
 +
 +#include <cerrno>
@@ -25,6 +25,7 @@ index 0000000..3504349
 +    double top_p = 1;
 +    double repetition_penalty = 1.05;
 +    int repeat_last_n = 128;
++    bool recover_repeats = false;
 +    std::string video_size = "1920x1080";
 +    double capture_fps = 30;
 +    std::string pixel_format;
@@ -105,6 +106,11 @@ index 0000000..3504349
 +    const std::string sys = get("sys");
 +    if (!sys.empty() && sys != "0" && sys != "1") { error = "sys must be 0 or 1"; return false; }
 +    if (!sys.empty()) o.system = sys == "1";
++    const std::string recover = get("recover-repeats");
++    if (!recover.empty() && recover != "0" && recover != "1") {
++        error = "recover-repeats must be 0 or 1"; return false;
++    }
++    if (!recover.empty()) o.recover_repeats = recover == "1";
 +    if (!get("prompt").empty()) o.initial_prompt = get("prompt");
 +    o.system_prompt = get("system-prompt");
 +    if (o.initial_prompt.size() > 8192 || o.system_prompt.size() > 8192) {
@@ -230,7 +236,7 @@ index 0830580..bc65b28 100644
      gp.top_k = top_k;
      gp.top_p = top_p;
 diff --git a/src/cli/vqa_server.cpp b/src/cli/vqa_server.cpp
-index 7ec9ed8..16076f3 100644
+index 7ec9ed8..b7064f3 100644
 --- a/src/cli/vqa_server.cpp
 +++ b/src/cli/vqa_server.cpp
 @@ -15,6 +15,7 @@
@@ -469,7 +475,7 @@ index 7ec9ed8..16076f3 100644
                  }
                  buf.erase(buf.begin(), buf.begin() + i + 1);
                  frame_start = std::string::npos;
-@@ -270,84 +346,110 @@ static void rt_reader_loop(std::shared_ptr<RtStream> s) {
+@@ -270,84 +346,123 @@ static void rt_reader_loop(std::shared_ptr<RtStream> s) {
              if (buf[i - 1] == 0xFF && buf[i] == 0xD8 && frame_start == std::string::npos)
                  frame_start = i - 1;
          }
@@ -483,6 +489,9 @@ index 7ec9ed8..16076f3 100644
  static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
 -    bool first = true;
 +    bool saw_vision = false;
++    std::string latest_question;
++    std::deque<std::string> recent_observations;
++    unsigned recovery_count = 0;
 +    auto next_turn = std::chrono::steady_clock::now();
      while (!s->stop_flag) {
 -        std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -511,7 +520,8 @@ index 7ec9ed8..16076f3 100644
 +            for (;;) {
 +                if (s->stop_flag) break;
 +                const auto now = std::chrono::steady_clock::now();
-+                const bool question = !s->prompts.empty() && (saw_vision || !s->jpegs.empty());
++                const bool question = !s->prompts.empty() &&
++                    (saw_vision || !s->jpegs.empty() || (recovery_count && !s->preview.empty()));
 +                if (question || (!s->jpegs.empty() && now >= next_turn)) break;
 +                if (!s->jpegs.empty() && now < next_turn) s->cv.wait_until(lk, next_turn);
 +                else s->cv.wait(lk);
@@ -539,6 +549,9 @@ index 7ec9ed8..16076f3 100644
 +            // Reader/API already bound this to the newest frames. Never infer
 +            // an accumulated FIFO backlog while the camera keeps moving.
 +            frames.swap(s->jpegs);
++            // A question after recovery at video EOF still needs the last frame.
++            if (recovery_count && !saw_vision && frames.empty() && !q.empty() && !s->preview.empty())
++                frames.push_back({s->preview, s->last_timestamp});
 +            s->interrupt = false;
 +            next_turn = std::chrono::steady_clock::now() +
 +                std::chrono::milliseconds((long long)(options.interval * 1000));
@@ -563,6 +576,10 @@ index 7ec9ed8..16076f3 100644
          }
          if (media.frames.empty() && q.empty()) continue;   // nothing new to say
 -        // model speaking on its own: frames-only turns, silence ends them
++        if (!q.empty()) {
++            latest_question = q;
++            recent_observations.clear();
++        }
          vqa::GenParams gp;
 -        gp.max_tokens = 200;
 -        std::string carry;
@@ -575,6 +592,8 @@ index 7ec9ed8..16076f3 100644
 +        gp.repeat_last_n = options.repeat_last_n;
 +        gp.continuous = true;
 +        gp.initial_prompt = options.initial_prompt;
++        if (recovery_count && q.empty() && !latest_question.empty())
++            gp.initial_prompt += "\n\n最近的用户问题（继续依据当前可见画面回答）：" + latest_question;
 +        gp.is_cancelled = [](void * ud) {
 +            auto * stream = (RtStream *)ud;
 +            return stream->stop_flag.load() || stream->interrupt.load();
@@ -625,7 +644,7 @@ index 7ec9ed8..16076f3 100644
              }
              if (m) s->silence_tok = m->silence_piece();
              if (!m || g_reg.loaded_id() != model_id) {
-@@ -356,42 +458,63 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
+@@ -356,42 +471,87 @@ static void rt_worker_loop(std::shared_ptr<RtStream> s, std::string model_id) {
              }
              if (!m->ask_session(media, q, gp, out)) {
                  s->push_event("{\"error\":\"turn failed\"}\n");
@@ -647,6 +666,30 @@ index 7ec9ed8..16076f3 100644
 +        { std::lock_guard<std::mutex> lk(s->mu); s->last_stats = stats; dropped = s->dropped; }
 +        s->push_event(std::string("{\"event\":\"") + (no_answer ? "silence" : "turn_end") +
 +            "\",\"stats\":" + stats_json(stats) + ",\"dropped_frames\":" + std::to_string(dropped) + "}\n");
++        // Repeated generated descriptions can poison the sliding self-cache.
++        // Recovery is opt-in: preserve the capture process, task, newest frame
++        // queue and latest question, but explicitly retire old model history.
++        if (options.recover_repeats && q.empty() && !no_answer) {
++            std::string key = out;
++            const size_t begin = key.find_first_not_of(" \t\r\n");
++            const size_t end = key.find_last_not_of(" \t\r\n");
++            key = begin == std::string::npos ? "" : key.substr(begin, end - begin + 1);
++            if (!key.empty()) recent_observations.push_back(key);
++            while (recent_observations.size() > 64) recent_observations.pop_front();
++            if (!key.empty() && std::count(recent_observations.begin(), recent_observations.end(), key) >= 3) {
++                {
++                    std::lock_guard<std::mutex> lk(g_mu);
++                    vqa::Model * m = g_reg.loaded();
++                    if (m && g_reg.loaded_id() == model_id) m->session_reset();
++                }
++                saw_vision = false;
++                recent_observations.clear();
++                ++recovery_count;
++                fprintf(stderr, "realtime: recovered repeated observations (%u resets)\n", recovery_count);
++                s->push_event("{\"event\":\"session_recovered\",\"reason\":\"repeated_observation\","
++                    "\"count\":" + std::to_string(recovery_count) + "}\n");
++            }
++        }
      }
  }
  
@@ -707,7 +750,7 @@ index 7ec9ed8..16076f3 100644
      s->worker = std::thread(rt_worker_loop, s, g_reg.loaded_id());
      return true;
  }
-@@ -406,10 +529,12 @@ static void rt_stop(const std::string & session) {
+@@ -406,10 +566,12 @@ static void rt_stop(const std::string & session) {
          g_rt.erase(it);
      }
      s->stop_flag = true;
@@ -721,12 +764,12 @@ index 7ec9ed8..16076f3 100644
  }
  
  std::string read_file(const std::string & p) {
-@@ -482,6 +607,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -482,6 +644,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
      // --- API ---
      if (req.method == "GET" && req.path == "/api/models") { send_json(c, models_json()); return true; }
      if (req.method == "GET" && req.path == "/api/specs") { send_json(c, vqa::specs_to_json()); return true; }
 +    if (req.method == "GET" && req.path == "/api/runtime") {
-+        send_json(c, "{\"runtime_api\":2,\"rt_frame\":true,\"cancel\":true,\"n_ctx\":" +
++        send_json(c, "{\"runtime_api\":2,\"rt_frame\":true,\"cancel\":true,\"recover_repeats\":true,\"n_ctx\":" +
 +            std::to_string(g_load_options.n_ctx) + ",\"threads\":" + std::to_string(g_load_options.n_threads) +
 +            ",\"gpu\":" + (g_load_options.use_gpu ? "true" : "false") + "}");
 +        return true;
@@ -734,7 +777,7 @@ index 7ec9ed8..16076f3 100644
  
      if (req.path.rfind("/api/model/", 0) == 0) {
          std::string rest = req.path.substr(11);
-@@ -494,35 +625,54 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -494,35 +662,54 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
          if (action.rfind("rt/", 0) == 0) {
              const std::string sess = query_param(req.query, "session");
              if (sess.empty()) { send_error(c, "need ?session="); return true; }
@@ -802,7 +845,7 @@ index 7ec9ed8..16076f3 100644
                  rt_stop(sess);
                  send_json(c, "{\"ok\":true}");
                  return true;
-@@ -530,24 +680,71 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -530,24 +717,71 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
              if (action == "rt/say" && req.method == "POST") {
                  std::lock_guard<std::mutex> lk(g_rt_mu);
                  auto it = g_rt.find(sess);
@@ -877,7 +920,7 @@ index 7ec9ed8..16076f3 100644
                  std::string body;
                  long last = since;
                  if (s) {
-@@ -567,6 +764,9 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -567,6 +801,9 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
          }
  
          if (req.method == "POST" && action == "load") {
@@ -887,7 +930,7 @@ index 7ec9ed8..16076f3 100644
              // swap in flight: same id is idempotent, anything else conflicts
              std::string busy_id;
              if (swap_busy(&busy_id)) {
-@@ -600,34 +800,42 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -600,34 +837,42 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
          if (req.method == "GET" && action == "status") {
              // poll target for async swaps: state loading (with coarse progress
              // bytes + elapsed) / ready / error (with the load's error text)
@@ -943,7 +986,7 @@ index 7ec9ed8..16076f3 100644
              // a swap owns g_mu for its whole read: reject fast (409) instead of
              // blocking this connection for the load's duration
              std::string busy_id;
-@@ -689,8 +897,20 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -689,8 +934,20 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                  return true;
              }
              vqa::GenParams gp;
@@ -966,7 +1009,7 @@ index 7ec9ed8..16076f3 100644
              // speech output (?speak=1): only for audio-capable backends that
              // loaded a talker; the wav lands in serve_speak.wav next to the exe
              const char * speak_path = nullptr;
-@@ -702,18 +922,21 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -702,18 +959,21 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
              gp.speak_wav = speak_path;
              std::string q = query_param(req.query, "q");
              std::string mode = query_param(req.query, "mode");
@@ -990,7 +1033,7 @@ index 7ec9ed8..16076f3 100644
              if (realtime) {
                  // ?sys=1 seeds the model's own streaming protocol prompt (the
                  // three-state markers / <|silence|>); off by default so plain
-@@ -725,13 +948,10 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -725,13 +985,10 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                  }
                  // the engine keeps ONE live session; a fresh HTTP session name
                  // must reset it, otherwise turn 1 splices onto a stranger's KV
@@ -1006,7 +1049,7 @@ index 7ec9ed8..16076f3 100644
              }
              // rebuild the conversation prefix from the stored turns (text-only:
              // media from earlier turns is not re-sent; ask about it again)
-@@ -751,9 +971,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -751,9 +1008,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
              // stream state shared by the token callback and the final flush
              static thread_local std::string carry;
              static thread_local bool sent_any;
@@ -1019,7 +1062,7 @@ index 7ec9ed8..16076f3 100644
                  // NDJSON events: {"phase":"vision"} once the media is decoded,
                  // {"t":".."} per generated piece, then {"done":true} / {"error":".."}
                  // Chinese (any multibyte UTF-8) is often split across two tokens;
-@@ -784,7 +1007,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -784,7 +1044,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                      if (emit < s.size()) { carry = s.substr(emit); s.resize(emit); }
                      if (!s.empty()) {
                          sent_any = true;
@@ -1029,7 +1072,7 @@ index 7ec9ed8..16076f3 100644
                      }
                  };
                  gp.on_token_ud = &c;
-@@ -792,7 +1016,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -792,7 +1053,7 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                      gp.on_stage = [](const char * stage, int done, int total, void * ud) {
                          char ev[96];
                          int n = snprintf(ev, sizeof(ev), "{\"stage\":\"%s\",\"done\":%d,\"total\":%d}", stage, done, total);
@@ -1038,7 +1081,7 @@ index 7ec9ed8..16076f3 100644
                      };
                      gp.on_stage_ud = &c;
                  }
-@@ -809,6 +1033,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -809,6 +1070,8 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                  else send_error(c, "inference failed");
                  return true;
              }
@@ -1047,7 +1090,7 @@ index 7ec9ed8..16076f3 100644
              // collect the talker's wav (if any) and ship it base64 inside the
              // final event / final JSON; a missing or empty file is not an error
              std::string wav_b64;
-@@ -823,12 +1049,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
+@@ -823,12 +1086,12 @@ bool handle_request(vqa::http::HttpSock c, const vqa::http::Request & req) {
                  // isn't left with an empty string ("未检测到目标")
                  if (!sent_any && !out.empty())
                      send_chunk_str(c, std::string("{\"t\":\"") + json_escape(out) + "\"}\n");
@@ -1064,7 +1107,7 @@ index 7ec9ed8..16076f3 100644
              if (!sess.empty() && !q.empty())
                  sessions[sess].push_back({q, out});   // remember the turn
              return true;
-@@ -875,9 +1101,9 @@ std::string id_placeholder;   // set per page request before serve_page
+@@ -875,9 +1138,9 @@ std::string id_placeholder;   // set per page request before serve_page
  
  namespace vqa {
  int run_web_ui(int port, const std::string & models_dir, const std::string & web_dir,
