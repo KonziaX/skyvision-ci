@@ -1214,7 +1214,7 @@ index ec3f3f6..e0f9d08 100644
  // MCP (Model Context Protocol) server over stdio (vqa-cli --mcp): exposes the
  // engine as agent-facing tools. `preset_model` is an optional id / gguf path
 diff --git a/src/models/moss_vl/moss_vl_model.cpp b/src/models/moss_vl/moss_vl_model.cpp
-index 902627b..624491c 100644
+index 902627b..40658b2 100644
 --- a/src/models/moss_vl/moss_vl_model.cpp
 +++ b/src/models/moss_vl/moss_vl_model.cpp
 @@ -24,6 +24,7 @@
@@ -1320,7 +1320,30 @@ index 902627b..624491c 100644
      if (token_budget > 0) {
          const long long per_frame = std::max((long long)token_budget / T - 1, 4LL);   // -1 separator
          max_pixels = std::min(max_pixels, per_frame * factor * factor);
-@@ -1488,7 +1504,81 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
+@@ -1378,15 +1394,18 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
+     if (use_static) {
+         const int blk = std::min(vqa::block_for(S), n_ctx);
+         if (!dec_gf || dec_blk != blk || dec_vtot != plan.n_vtot) {
++            // build_text_graph owns the allocation until we adopt its context.
++            // Allocating dec_ctx first leaked the separate 64 MiB dg.ctx on
++            // every rebuild (new video rows change plan.n_vtot each frame).
+             if (dec_ctx) ggml_free(dec_ctx);
+-            struct ggml_init_params ip = { 64ull * 1024 * 1024, NULL, true };
+-            dec_ctx = ggml_init(ip);
++            dec_ctx = nullptr;
++            dec_gf = nullptr;
+             TextGraph dg;
+-            dg.ctx = dec_ctx;
+             if (!build_text_graph(dg, plan, 1, blk, blk)) {
+-                ggml_free(dec_ctx); dec_ctx = nullptr; dec_gf = nullptr;
++                if (dg.ctx) ggml_free(dg.ctx);
+                 return false;
+             }
++            dec_ctx = dg.ctx;
+             dec_gf = dg.gf;
+             vqa::dump::finalize_sinks(dec_ctx, dec_gf, backend);
+             if (!ggml_gallocr_alloc_graph(dec_allocr, dec_gf)) {
+@@ -1488,7 +1507,81 @@ bool MossVL::run_text(TextGraph & g, const PromptPlan & plan, const std::vector<
  }
  
  int MossVL::sample(const std::vector<float> & logits, const vqa::GenParams & gp) {
@@ -1403,7 +1426,7 @@ index 902627b..624491c 100644
  }
  
  // raw host-side inputs for parity (no graph tensor round trip)
-@@ -1513,16 +1603,17 @@ void MossVL::dump(const ggml_cgraph * gf, const char * name) {
+@@ -1513,16 +1606,17 @@ void MossVL::dump(const ggml_cgraph * gf, const char * name) {
  
  bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
                   const std::string & /*mode*/, const vqa::GenParams & gp, std::string & out_text) {
@@ -1425,7 +1448,7 @@ index 902627b..624491c 100644
  
      // 1. measure the text overhead with a 1-frame probe, then size the vision
      //    budget (like vc3: clamp or reject BEFORE the multi-second vision encode)
-@@ -1533,11 +1624,11 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1533,11 +1627,11 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
          probe.frames.resize(1);
          PromptPlan pp;
          const int g4[2] = {4, 4};
@@ -1440,7 +1463,7 @@ index 902627b..624491c 100644
          fprintf(stderr, "n_ctx %d too small: prompt ~%d tokens + max_new %d\n",
                  n_ctx, text_overhead, gp.max_tokens);
          return false;
-@@ -1546,7 +1637,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1546,7 +1640,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
      std::vector<float> patches, pos;
      std::vector<int> vpos;
      int gh = 0, gw = 0;
@@ -1449,7 +1472,7 @@ index 902627b..624491c 100644
      std::vector<int> grids;
      if (T > 0) {
          const int eh = gh / vc.merge, ew = gw / vc.merge;
-@@ -1555,7 +1646,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1555,7 +1649,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
  
      PromptPlan plan;
      if (!build_prompt(media, prompt, grids, plan, gp.history)) return false;
@@ -1458,7 +1481,7 @@ index 902627b..624491c 100644
          fprintf(stderr, "n_ctx %d too small: prompt %d + vision %d + max_new %d\n",
                  n_ctx, (int)plan.ids.size(), plan.n_vtot, gp.max_tokens);
          return false;
-@@ -1573,6 +1664,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1573,6 +1667,7 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
              for (size_t k = 0; k < fr.rgb.size(); k++) { key ^= fr.rgb[k]; key *= 1099511628211ull; }
          }
          key ^= (uint64_t)media.width << 32 ^ (uint64_t)media.height;
@@ -1466,7 +1489,7 @@ index 902627b..624491c 100644
          // Both paths share ONE projection graph now: encode_vision produces
          // only the merger output (terminal node, trustworthy readback), and
          // the cross-KV projection always runs in project_cross_kv() - so a
-@@ -1594,6 +1686,8 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1594,6 +1689,8 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
          if (!project_cross_kv(vcache.merged, plan)) return false;
      }
      if (gp.on_stage) gp.on_stage("vision", 1, 1, gp.on_stage_ud);
@@ -1475,7 +1498,7 @@ index 902627b..624491c 100644
      fprintf(stderr, "[perf] vision: %.0f ms (%d cross rows)\n",
              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv0).count(),
              plan.n_vtot);
-@@ -1604,34 +1698,10 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1604,34 +1701,10 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
      const auto t_pf0 = std::chrono::steady_clock::now();
      if (!run_text(g, plan, plan.ids, 0, logits)) return false;
      const auto t1 = std::chrono::steady_clock::now();
@@ -1514,7 +1537,7 @@ index 902627b..624491c 100644
      sess_plan = plan;      // snapshot for a session started on top of this ask
      sess_vrows = plan.n_vtot;
      sess_rdelta = plan.rope_delta;
-@@ -1653,13 +1723,53 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
+@@ -1653,13 +1726,53 @@ bool MossVL::ask(const vqa::MediaInput & media, const std::string & prompt,
  //   frames:      <|vision_start|><|time_start|>t<|time_end|><|image_pad|>...<|vision_end|>
  bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prompt,
                           const vqa::GenParams & gp, std::string & out_text) {
@@ -1569,7 +1592,7 @@ index 902627b..624491c 100644
  
      // 1. vision for the new frames (host path: incremental rows into the cache)
      const int T_new = (int)media.frames.size();
-@@ -1667,8 +1777,10 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1667,8 +1780,10 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
      std::vector<int> vpos;
      int gh = 0, gw = 0;
      if (T_new > 0) {
@@ -1582,7 +1605,7 @@ index 902627b..624491c 100644
      }
      std::vector<int> grids;
      if (T_new > 0) {
-@@ -1678,8 +1790,9 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1678,8 +1793,9 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
  
      // 2. build the splice text exactly like the official realtime loop
      std::string text;
@@ -1594,7 +1617,7 @@ index 902627b..624491c 100644
          // official realtime loop inserts <|silence|> when a prompt drains
          // alongside frames: every assistant turn in the SFT data starts with
          // it ("confirmed with project team" in modeling_moss_vl.py). Without
-@@ -1688,17 +1801,24 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1688,17 +1804,24 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
          if (T_new > 0 && !(getenv("MOSS_RT_SILENCE") && atoi(getenv("MOSS_RT_SILENCE")) == 0))
              text += "<|silence|>";
      }
@@ -1621,7 +1644,7 @@ index 902627b..624491c 100644
      }
  
      // 3. plan the segment against the live caches, then make room:
-@@ -1706,13 +1826,17 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1706,13 +1829,17 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
      //    plan_from_text is cheap (tokenize + index bookkeeping), so plan ->
      //    compact -> re-plan is fine.
      PromptPlan seg;
@@ -1641,7 +1664,7 @@ index 902627b..624491c 100644
          if (!plan_from_text(text, grids, seg, n_past + sess_rdelta, n_past, sess_vrows))
              return false;
      }
-@@ -1727,17 +1851,15 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1727,17 +1854,15 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
  
      // 4. project the new frames' cross-KV rows (appended after the old ones)
      if (T_new > 0) {
@@ -1662,7 +1685,7 @@ index 902627b..624491c 100644
              fprintf(stderr, "session vision: cache hit\n");
          } else {
              const int N = (int)(patches.size() / (3 * vc.patch * vc.patch));
-@@ -1746,57 +1868,21 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
+@@ -1746,57 +1871,21 @@ bool MossVL::ask_session(const vqa::MediaInput & media, const std::string & prom
          }
          if (!project_cross_kv(scache.merged, seg, sess_vrows)) return false;
      }

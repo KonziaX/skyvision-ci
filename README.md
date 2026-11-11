@@ -8,6 +8,8 @@ The patch exposes the MOSS runtime controls, corrects realtime initialization,
 commits the final generated token and a turn boundary on capped/interrupted
 turns, bounds the camera queue to recent frames, and accepts browser JPEG/PNG
 frames. Text-only turns rebuild physical KV positions after context eviction.
+Static decode graph rebuilds retain and free the context actually returned by
+the graph builder, preventing a 64 MiB host allocation leak on each new frame.
 CUDA graphs and flash attention remain enabled. Model dimensions and
 token identifiers still come from the GGUF/tokenizer; do not change them as
 performance knobs.
@@ -101,5 +103,15 @@ disconnects. It also verifies the two-second camera filter against generated
 30/60 FPS sources; it does not access a real camera. `tests/benchmark_backend.py`
 compares retained/rebuilt binaries using the same image and question. These
 scripts write reports and logs under the explicitly selected output directory.
+
+`tests/long_stream_regression.py` accepts an explicitly selected local video,
+streams resized frames through the browser-frame API, and monitors Windows
+private bytes on every turn. It starts and stops only its own test process,
+aborts excessive memory growth before exhausting system commit, and reports
+steady-state growth after warmup. Use at least 600 frames to exceed the 480-turn
+failure seen with the old static graph owner; `--frames 1000` covers repeated
+visual-cache compaction. `--disable-static` and `--disable-cuda-graphs` are
+diagnostic controls for retained old binaries, not normal deployment defaults.
+Video bytes and generated frames stay local; do not upload them to Actions.
 
 Protocol reference: [MOSS realtime documentation](https://github.com/OpenMOSS/MOSS-VL/blob/main/inference/realtime/README.md).
